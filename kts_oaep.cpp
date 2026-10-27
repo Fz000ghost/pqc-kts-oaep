@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 // Build:  g++ -std=c++20 -O2 -Wall kts_oaep.cpp -o ping
 // VM-V:   ./ping server 5000
 // VM-U:   ./ping client 10.0.2.2 5000
@@ -80,4 +81,16 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "usage: %s server <port> | client <host> <port>\n", argv[0]);
         return 2;
     }
+=======
+#include <botan/hash.h>
+#include <botan/hex.h>
+#include <botan/version.h>
+#include <iostream>
+
+int main() {
+    auto sha = Botan::HashFunction::create_or_throw("SHA-256");
+    sha->update("abc");
+    std::cout << Botan::version_string() << "\n"
+              << "SHA-256(\"abc\") = " << Botan::hex_encode(sha->final(), false) << "\n";
+>>>>>>> db50376 (Botan check)
 }
