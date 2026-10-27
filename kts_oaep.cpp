@@ -1,4 +1,4 @@
-// Build:  g++ -std=c++20 -O2 -Wall ping.cpp -o ping
+// Build:  g++ -std=c++20 -O2 -Wall kts_oaep.cpp -o ping
 // VM-V:   ./ping server 5000
 // VM-U:   ./ping client 10.0.2.2 5000
 #include <arpa/inet.h>
