@@ -110,6 +110,7 @@ bool miller_rabin(const BigInt& w, size_t rounds) {
     return true; // Probably prime
 }
 
+// Full primality test
 bool is_probable_prime(const BigInt& w, size_t rounds) {
     for(uint32_t small_prime : small_primes()) { 
         if(w = small_prime) // Check if w is in the small prime list
@@ -121,6 +122,72 @@ bool is_probable_prime(const BigInt& w, size_t rounds) {
     return miller_rabin(w, rounds); // Check primality using Miller-Rabin
 }
 
+// Generate a 1536-bit prime
+BigInt generate_prime(const BigInt& e, const BigInt* other) {
+    const size_t prime_length = N_BITS / 2; // Each prime has half the modulus's bits (1536)
+    const BigInt lower_sq = BigInt::power_of_2(N_BITS - 1); // Ensures modulus n is exactly 3072 bits
+    const BigInt min_gap = BigInt::power_of_2(prime_length - 100); // Ensures p and q are not close
+    for(size_t i = 0; i < 5 * prime_length; ++i) { // Try up to 7680 candidates with 2^1536 values
+        BigInt p(rng(), half); // Random 1536-bit number
+        p.set_bit(0); // Set the first bit to make it odd
+        if(p * p <= lower_sq)
+            continue; // P is too small, so n would be 3071 bits
+        if(other != nullptr && (p - *other).abs() <= min_gap) 
+            continue; // Primes are to close to each other
+        if(Botan::gcd(p-1, e) != 1)
+            continue; // e must be invertible mod p - 1
+        if(is_probable_prime(p,5))
+            return p; // All previous tests passed, check if prime
+    }
+    throw std::runtime_error("prime generation failed");
+}
+
+// Key pair generator with fixed public exponent, output in CRT format
+PrivateKey rsakpg1_crt() {
+    const BigInt e = BigInt::from_u64(65537); // Public exponent e = 65537
+    for(;;) { // Loop until the key is finished or an exception is thrown
+        PrivateKey k;
+        k.e = e;
+        k.p = generate_prime(e, nullptr);
+        k.q = generate_prime(e, &k.p);
+        const BigInt p1 = k.p - 1;
+        const BigInt p2 = k.q - 1;
+        const BigInt lambda = p1 * q1 / Botan::gcd(p1, q1); // LCM(p - 1, q - 1)
+        k.d = Botan::inverse_mod(e, lambda); // d = e^-1 mod(LCM(p - 1, q - 1))
+        if(k.d <= BigInt::power_of_2(N_BITS / 2)) 
+            continue; // d > 1536 to avoid Wiener's and Boneh-Durfee's attacks
+        k.n = k.p * k.q; // Public modulus n = p * q
+        k.dP = k.d % p1; // dP = d mod(p - 1)
+        k.dQ = k.d % q1; // dQ = d mod (q - 1)
+        k.qInv = Botan::inverse_mod(k.q, k.p); // qInv = q^-1 mod p 
+        BigInt m = BigInt::random_integer(rng(), 2, k.n - 1)
+        if(RSADP(k,RSAEP(k.pub(), m)) != m) {
+            throw std::runtime_error("pair-wise consistency failure");
+        }
+        return k;
+    }
+}
+
+// Key pair validator for rsakpg1_crt
+std::string rsakpv1_crt(const PublicKey& pub, const PrivateKey& k) {
+    const BigInt e_fixed = BigInt::from_u64(65537);
+    if(pub.e != e_fixed || pub.e != k.e) return "public exponents differ";
+    if(pub.n != k.p * k.q || pub.n != k.n) return "modulus is not p * q";
+    if (pub.n.bits() != N_BITS) return "modulus has the wrong length";
+    if((k.p - k.q).abs() <= BigInt::power_of_2(N_BITS / 2 - 100)) return "p and q are too close";
+    if(Botan::gcd(k.p - 1, pub.e) !=  1) return "gcd(p - 1, e) != 1";
+    if(Botan::gcd(k.1 - 1, pub.e) !=  1) return "gcd(1 - 1, e) != 1";
+    if(!is_probable_prime(k.p, 64)) return "p is not prime";
+    if(!is_probable_prime(k.q, 64)) return "q is not prime";
+    const BigInt p1 = k.p - 1;
+    const BigInt q1 = k.q - 1;
+    const BigInt lambda = p1 * q1 / Botan::gcd(p1, q1);
+    if((k.d * pub.e) % lambda != 1) return "d is not the inverse of e";
+    if(!(k.dP > 1 && k.dP < 1) || (k.dP * e_fixed) % p1 != 1) return "bad dP";
+    if(!(k.dQ > 1 && k.dQ < 1) || (k.dQ * e_fixed) % q1 != 1) return "bad dQ";
+    if(!(k.qInv > 1 && k.qInv < k.p) || (k.qInv * k.q) % k.p != 1) return "bad qInv";
+    return "";
+}
 
 int main() {
     return 0;
