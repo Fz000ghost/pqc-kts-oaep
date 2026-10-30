@@ -50,6 +50,15 @@ constexpr size_t WARMUP = 5; // First 5 runs are thrown away
 const std::string ID_U = "party-U";
 const std::string ID_V = "party-V";
 
+struct PublicKey {
+    BigInt n, e:
+}
+
+struct PrivateKey {
+    BigInt n, e, d, p, q, dP, dQ, qInv;
+    PublicKey pub() const {return {n, e};}
+}
+
 Botan::RandomNumberGenerator& rng(){ // Random number generator
     static Botan::AutoSeeded_RNG r;
     return r;
@@ -141,6 +150,10 @@ BigInt generate_prime(const BigInt& e, const BigInt* other) {
     }
     throw std::runtime_error("prime generation failed");
 }
+// Least common multiple using BigInt
+BigInt bigint_lcm(const BigInt& a, const BigInt& b){
+    return a * b / Botan::gcd(a, b);
+}
 
 // Key pair generator with fixed public exponent, output in CRT format
 PrivateKey rsakpg1_crt() {
@@ -151,16 +164,16 @@ PrivateKey rsakpg1_crt() {
         k.p = generate_prime(e, nullptr);
         k.q = generate_prime(e, &k.p);
         const BigInt p1 = k.p - 1;
-        const BigInt p2 = k.q - 1;
-        const BigInt lambda = p1 * q1 / Botan::gcd(p1, q1); // LCM(p - 1, q - 1)
+        const BigInt q1 = k.q - 1;
+        const BigInt lambda = bigint_lcm(p1, q1);
         k.d = Botan::inverse_mod(e, lambda); // d = e^-1 mod(LCM(p - 1, q - 1))
         if(k.d <= BigInt::power_of_2(N_BITS / 2)) 
-            continue; // d > 1536 to avoid Wiener's and Boneh-Durfee's attacks
+            continue; // d > 2^1536 to avoid Wiener's and Boneh-Durfee's attacks
         k.n = k.p * k.q; // Public modulus n = p * q
         k.dP = k.d % p1; // dP = d mod(p - 1)
         k.dQ = k.d % q1; // dQ = d mod (q - 1)
         k.qInv = Botan::inverse_mod(k.q, k.p); // qInv = q^-1 mod p 
-        BigInt m = BigInt::random_integer(rng(), 2, k.n - 1)
+        BigInt m = BigInt::random_integer(rng(), 2, k.n - 1);
         if(RSADP(k,RSAEP(k.pub(), m)) != m) {
             throw std::runtime_error("pair-wise consistency failure");
         }
@@ -181,7 +194,7 @@ std::string rsakpv1_crt(const PublicKey& pub, const PrivateKey& k) {
     if(!is_probable_prime(k.q, 64)) return "q is not prime";
     const BigInt p1 = k.p - 1;
     const BigInt q1 = k.q - 1;
-    const BigInt lambda = p1 * q1 / Botan::gcd(p1, q1);
+    const BigInt lambda = bigint_lcm(p1, q1);
     if((k.d * pub.e) % lambda != 1) return "d is not the inverse of e";
     if(!(k.dP > 1 && k.dP < 1) || (k.dP * e_fixed) % p1 != 1) return "bad dP";
     if(!(k.dQ > 1 && k.dQ < 1) || (k.dQ * e_fixed) % q1 != 1) return "bad dQ";
@@ -191,4 +204,4 @@ std::string rsakpv1_crt(const PublicKey& pub, const PrivateKey& k) {
 
 int main() {
     return 0;
-}
+}   
