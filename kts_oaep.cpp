@@ -56,7 +56,7 @@ struct PublicKey {
 
 struct PrivateKey {
     BigInt n, e, d, p, q, dP, dQ, qInv;
-    PublicKey pub() const {return {n, e};}
+    PublicKey pub() const {return {n, e};} // Contains the public part of the key
 }
 
 Botan::RandomNumberGenerator& rng(){ // Random number generator
@@ -201,6 +201,33 @@ std::string rsakpv1_crt(const PublicKey& pub, const PrivateKey& k) {
     if(!(k.qInv > 1 && k.qInv < k.p) || (k.qInv * k.q) % k.p != 1) return "bad qInv";
     return "";
 }
+
+// Convert an integer (BigInt) to a byte string with the given length.
+Bytes I2BS(const BigInt& x, size_t len) {
+    if(x.bytes() > len)
+        throw std::runtime_error("Integer too large for the requested length");
+    Bytes out(len); // Create len zero bytes
+    x.serialize_to(out); // Write value x into out
+    return out;
+}
+
+
+BigInt BS2I(const Bytes& b) { return BigInt(b.data(), b.size()); } // Convert a byte string into an integer (BigInt)
+
+void put_u32(Bytes& out, uint32_t v) { // Converts an integer into base 256 with exactly 4 digits (4 big-endian bytes)
+    for(int shift = 24; shift >= 0; shift -= 8)
+        out.push_back(static_cast<uint8_t>(v >> shift));
+}
+
+void append(Bytes& out, const Bytes& b) { out.insert(out.end(), b.begin(), b.end()); } // Concatenate a bytes string onto the end of the first
+void append(Bytes& out, const std::string& s) { out.insert(out.end(), s.begin(), s.end()); } // Concatenate a string (ASCII to bytes) onto the end of a byte string
+
+void xor_into(Bytes& a, const Bytes& b) { // XOR two equal length byte strings
+    for(size_t i = 0; i < a.size(); ++i)
+        a[i] ^= b[i]; // Writes the result on the first string
+}
+
+
 
 int main() {
     return 0;
