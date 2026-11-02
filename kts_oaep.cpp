@@ -37,27 +37,27 @@
 #include <vector>
 
 using Botan::BigInt;
-using Bytes = Botan:secure_vector<uint8_t>; // Byte array wiped from memory when freed
+using Bytes = Botan::secure_vector<uint8_t>; // Byte array wiped from memory when freed
 
 constexpr size_t N_BITS = 3072; // 128-bit security 
 constexpr size_t N_LEN = N_BITS/8; // 384 bytes
 constexpr size_t H_LEN = 32; // SHA-256 output
 constexpr size_t MAC_KEY_LEN = 32; // Length of MAC key (first 32 bytes)
 constexpr size_t KEY_DATA_LEN = 32; // Length of the secret (next 32 bytes)
-constexpr size_t K_LEN = MAX_KEY_LEN + KEY_DATA_LEN; // Length of the keying material K (64 bytes)
+constexpr size_t K_LEN = MAC_KEY_LEN + KEY_DATA_LEN; // Length of the keying material K (64 bytes)
 constexpr size_t MAC_TAG_LEN = 32; // Full HMAC-SHA-256 output (32 bytes)
 constexpr size_t WARMUP = 5; // First 5 runs are thrown away
 const std::string ID_U = "party-U";
 const std::string ID_V = "party-V";
 
 struct PublicKey {
-    BigInt n, e:
-}
+    BigInt n, e;
+};
 
 struct PrivateKey {
     BigInt n, e, d, p, q, dP, dQ, qInv;
     PublicKey pub() const {return {n, e};} // Contains the public part of the key
-}
+};
 
 Botan::RandomNumberGenerator& rng(){ // Random number generator
     static Botan::AutoSeeded_RNG r;
@@ -66,7 +66,7 @@ Botan::RandomNumberGenerator& rng(){ // Random number generator
 
 // Generate a vector with all prime numbers up to a limit using the sieve of Eratosthenes
 namespace{
-    std::vector<uint32_t> erathostenes(uint32_t limit) {
+    std::vector<uint32_t> eratosthenes(uint32_t limit) {
         std::vector <uint32_t> primes;
         std::vector<bool> composite(limit, false);
         for(uint32_t i = 2; i < limit; ++i) {
@@ -82,7 +82,7 @@ namespace{
 
 // Get all primes below 2000 to throw away prime candidates cheaply before Miller-Rabin test
 const std::vector<uint32_t>& get_small_primes() { 
-    static const std::vector<uint32_t> primes = erathostenes(2000);
+    static const std::vector<uint32_t> primes = eratosthenes(2000);
     return primes;
 }
 
@@ -95,7 +95,7 @@ bool miller_rabin(const BigInt& w, size_t rounds) {
     BigInt m = w - 1;
     size_t a = 0;
     while(m.is_even()) {
-        m /= 2; // Divides by 2 by shifting bits right (faster than a real division)
+        m >>= 1; // Divides by 2 by shifting bits right
         ++a;
     }
     for(size_t i = 0; i < rounds; ++i) {
@@ -121,8 +121,8 @@ bool miller_rabin(const BigInt& w, size_t rounds) {
 
 // Full primality test
 bool is_probable_prime(const BigInt& w, size_t rounds) {
-    for(uint32_t small_prime : small_primes()) { 
-        if(w = small_prime) // Check if w is in the small prime list
+    for(uint32_t small_prime : get_small_primes()) { 
+        if(w == small_prime) // Check if w is in the small prime list
             return true;
         if(w % small_prime == 0) // Filter odd numbers with a prime factor
             return false;
@@ -137,8 +137,8 @@ BigInt generate_prime(const BigInt& e, const BigInt* other) {
     const BigInt lower_sq = BigInt::power_of_2(N_BITS - 1); // Ensures modulus n is exactly 3072 bits
     const BigInt min_gap = BigInt::power_of_2(prime_length - 100); // Ensures p and q are not close
     for(size_t i = 0; i < 5 * prime_length; ++i) { // Try up to 7680 candidates with 2^1536 values
-        BigInt p(rng(), half); // Random 1536-bit number
-        p.set_bit(0); // Set the first bit to make it odd
+        BigInt p(rng(), prime_length); // Random 1536-bit number
+        p.set_bit(0); // Makes the number odd
         if(p * p <= lower_sq)
             continue; // P is too small, so n would be 3071 bits
         if(other != nullptr && (p - *other).abs() <= min_gap) 
@@ -181,7 +181,7 @@ PrivateKey rsakpg1_crt() {
     }
 }
 
-// Key pair validator for rsakpg1_crt
+// Key pair validator for rsakpg1_crt according to the rules established by SP 800-56-B
 std::string rsakpv1_crt(const PublicKey& pub, const PrivateKey& k) {
     const BigInt e_fixed = BigInt::from_u64(65537);
     if(pub.e != e_fixed || pub.e != k.e) return "public exponents differ";
@@ -189,16 +189,21 @@ std::string rsakpv1_crt(const PublicKey& pub, const PrivateKey& k) {
     if (pub.n.bits() != N_BITS) return "modulus has the wrong length";
     if((k.p - k.q).abs() <= BigInt::power_of_2(N_BITS / 2 - 100)) return "p and q are too close";
     if(Botan::gcd(k.p - 1, pub.e) !=  1) return "gcd(p - 1, e) != 1";
-    if(Botan::gcd(k.1 - 1, pub.e) !=  1) return "gcd(1 - 1, e) != 1";
+    if(Botan::gcd(k.q - 1, pub.e) !=  1) return "gcd(q - 1, e) != 1";
     if(!is_probable_prime(k.p, 64)) return "p is not prime";
     if(!is_probable_prime(k.q, 64)) return "q is not prime";
     const BigInt p1 = k.p - 1;
     const BigInt q1 = k.q - 1;
     const BigInt lambda = bigint_lcm(p1, q1);
     if((k.d * pub.e) % lambda != 1) return "d is not the inverse of e";
-    if(!(k.dP > 1 && k.dP < 1) || (k.dP * e_fixed) % p1 != 1) return "bad dP";
-    if(!(k.dQ > 1 && k.dQ < 1) || (k.dQ * e_fixed) % q1 != 1) return "bad dQ";
+    if(!(k.dP > 1 && k.dP < p1) || (k.dP * e_fixed) % p1 != 1) return "bad dP";
+    if(!(k.dQ > 1 && k.dQ < q1) || (k.dQ * e_fixed) % q1 != 1) return "bad dQ";
     if(!(k.qInv > 1 && k.qInv < k.p) || (k.qInv * k.q) % k.p != 1) return "bad qInv";
+    const BigInt lower_sq = BigInt::power_of_2(N_BITS - 1);
+    const BigInt upper = BigInt::power_of_2(N_BITS / 2);
+    if(k.p * k.p <= lower_sq || k.p >= upper) return "p out of range";
+    if(k.q * k.q <= lower_sq || k.q >= upper) return "q out of range";
+    if(!(k.d > upper && k.d < lambda)) return "d out of range";
     return "";
 }
 
