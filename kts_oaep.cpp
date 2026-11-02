@@ -155,6 +155,23 @@ BigInt bigint_lcm(const BigInt& a, const BigInt& b){
     return a * b / Botan::gcd(a, b);
 }
 
+// RSA encryption primitive
+BigInt RSAEP(const PublicKey& pub, const BigInt& m) {
+    if(!(m > 1 && m < pub.n - 1))
+        throw std::runtime_error("m out of range");
+    return Botan::power_mod(m, pub.e, pub.n); // c = m^e mod n
+}
+
+// RSA decryption primitive m = c^d mod n in CRT form
+BigInt RSADP(const PrivateKey& k, const BigInt& c) {
+    if(!(c > 1 && c < k.n - 1))
+        throw std::runtime_error("c out of range");
+    BigInt mp = Botan::power_mod(c, k.dP, k.p); // mp = c^dP mod p
+    BigInt mq = Botan::power_mod(c, k.dQ, k.q); // mq = c^dQ mod q
+    BigInt h = (k.qInv * (mp + k.p - mq % k.p)) % k.p; // (mp - mq) * qInv mod p (never below zero due to mp + p - (mq mod p))
+    return (mq + k.q * h) % k.n; // m = mq + q*h mod n
+}
+
 // Key pair generator with fixed public exponent, output in CRT format
 PrivateKey rsakpg1_crt() {
     const BigInt e = BigInt::from_u64(65537); // Public exponent e = 65537
