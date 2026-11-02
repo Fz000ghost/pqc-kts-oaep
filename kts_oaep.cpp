@@ -127,7 +127,6 @@ bool is_probable_prime(const BigInt& w, size_t rounds) {
         if(w % small_prime == 0) // Filter odd numbers with a prime factor
             return false;
     }
-
     return miller_rabin(w, rounds); // Check primality using Miller-Rabin
 }
 
@@ -191,9 +190,8 @@ PrivateKey rsakpg1_crt() {
         k.dQ = k.d % q1; // dQ = d mod (q - 1)
         k.qInv = Botan::inverse_mod(k.q, k.p); // qInv = q^-1 mod p 
         BigInt m = BigInt::random_integer(rng(), 2, k.n - 1);
-        if(RSADP(k,RSAEP(k.pub(), m)) != m) {
+        if(RSADP(k,RSAEP(k.pub(), m)) != m)
             throw std::runtime_error("pair-wise consistency failure");
-        }
         return k;
     }
 }
@@ -233,23 +231,25 @@ Bytes I2BS(const BigInt& x, size_t len) {
     return out;
 }
 
-
-BigInt BS2I(const Bytes& b) { return BigInt(b.data(), b.size()); } // Convert a byte string into an integer (BigInt)
+// Convert a byte string into an integer (BigInt)
+BigInt BS2I(const Bytes& b) { return BigInt(b.data(), b.size()); } 
 
 void put_u32(Bytes& out, uint32_t v) { // Converts an integer into base 256 with exactly 4 digits (4 big-endian bytes)
     for(int shift = 24; shift >= 0; shift -= 8)
         out.push_back(static_cast<uint8_t>(v >> shift));
 }
 
-void append(Bytes& out, const Bytes& b) { out.insert(out.end(), b.begin(), b.end()); } // Concatenate a bytes string onto the end of the first
-void append(Bytes& out, const std::string& s) { out.insert(out.end(), s.begin(), s.end()); } // Concatenate a string (ASCII to bytes) onto the end of a byte string
+// Concatenate a bytes string onto the end of the first
+void append(Bytes& out, const Bytes& b) { out.insert(out.end(), b.begin(), b.end()); } 
 
-void xor_into(Bytes& a, const Bytes& b) { // XOR two equal length byte strings
+ // Concatenate a string (ASCII to bytes) onto the end of a byte string
+void append(Bytes& out, const std::string& s) { out.insert(out.end(), s.begin(), s.end()); }
+
+// XOR two equal length byte strings
+void xor_into(Bytes& a, const Bytes& b) { 
     for(size_t i = 0; i < a.size(); ++i)
         a[i] ^= b[i]; // Writes the result on the first string
 }
-
-
 
 int main() {
     return 0;
