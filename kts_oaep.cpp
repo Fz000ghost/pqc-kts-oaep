@@ -154,6 +154,25 @@ BigInt bigint_lcm(const BigInt& a, const BigInt& b){
     return a * b / Botan::gcd(a, b);
 }
 
+//Hashes a byte string with SHA-256
+Bytes sha256(const Bytes& data) {
+    auto h = Botan::HashFunction::create_or_throw("SHA-256");
+    h->update(data);
+    return h->final();
+}
+
+// 351-byte mask generation (MGF1) using SHA-256
+Bytes MGF1(const Bytes& seed, size_t mask_len) {
+    Bytes T;
+    for(uint32_t counter = 0; T.size() < mask_len; ++counter) { 
+        Bytes input = seed;
+        put_u32(input, counter);
+        append(T, sha256(input)); // Append the 32 output bytes to T
+    }
+    T.resize(mask_len); 
+    return T;
+}
+
 // RSA encryption primitive
 BigInt RSAEP(const PublicKey& pub, const BigInt& m) {
     if(!(m > 1 && m < pub.n - 1))
