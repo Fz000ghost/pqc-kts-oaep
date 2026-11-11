@@ -241,7 +241,7 @@ std::string rsakpv1_crt(const PublicKey& pub, const PrivateKey& k) {
     return "";
 }
 
-// Convert an integer (BigInt) to a byte string with the given length.
+// Convert an integer (BigInt) to a byte string with the given length
 Bytes I2BS(const BigInt& x, size_t len) {
     if(x.bytes() > len)
         throw std::runtime_error("Integer too large for the requested length");
@@ -253,7 +253,8 @@ Bytes I2BS(const BigInt& x, size_t len) {
 // Convert a byte string into an integer (BigInt)
 BigInt BS2I(const Bytes& b) { return BigInt(b.data(), b.size()); } 
 
-void put_u32(Bytes& out, uint32_t v) { // Converts an integer into base 256 with exactly 4 digits (4 big-endian bytes)
+// Converts an integer into base 256 with exactly 4 digits (4 big-endian bytes)
+void put_u32(Bytes& out, uint32_t v) { 
     for(int shift = 24; shift >= 0; shift -= 8)
         out.push_back(static_cast<uint8_t>(v >> shift));
 }
@@ -268,6 +269,73 @@ void append(Bytes& out, const std::string& s) { out.insert(out.end(), s.begin(),
 void xor_into(Bytes& a, const Bytes& b) { 
     for(size_t i = 0; i < a.size(); ++i)
         a[i] ^= b[i]; // Writes the result on the first string
+}
+
+// Turns keying materiak K into a 384 byte (3072 bits) block
+Bytes RSA_OAEP_ENCRYPT(const PublicKey& pub, const Bytes& K, const Bytes& A) {
+    const size_t nLen = (pub.n.bits() + 7) / 8; // Modulus length in bytes (384)
+    if(K.size() > nLen - 2 * H_LEN - 2) // K is too long to fit on the keying material (max 318 bytes, since H_LEN is 32)
+        throw std::runtime_error("keying material too long");
+    Bytes HA = sha256(A); // Hashes A, the identity of both parties
+    Bytes DB = HA; // Builds the data block starting with the hash
+    DB.insert(DB.end(), nLen - K.size() - 2 * H_LEN - 2, 0x00); // Adds 254 zero bytes of extra padding to DB
+    DB.push_back(0x01); // Adds 01 to mark where padding ends and K begins
+    append(DB, K); // Adds K to DB
+    Bytes mgfSeed(H_LEN); 
+    rng().randomize(mgfSeed); // Create a new random 32-byte seed to use as a mask
+    Bytes maskedDB = DB;
+    xor_into(maskedDB, MGF1(mgfSeed), nLen - H_LEN - 1); // XOR the DB with the seed using MGF1
+    Bytes maskedSeed = mgfSeed;
+    xor_into(maskedSeed, MGF1(maskedDB, H_LEN)); // XOR the masked seed with the masked database using MGF1
+    Bytes EM{0x00};
+    append(EM, maskedSeed);
+    append(EM, maskedDB); // Encoded message = 00 | maskedSeed | maskedDB = 384 bytes
+    BigInt c = RSAEP(pub, BS2I(EM)); // Apply RSAEP to EM (as an integer)
+    return I2BS(c, nLen); // Return c as a 384 byte string
+}
+
+// Returns 1 if x is zero and 0 if otherwise in constant time
+uint8_t ct_is_zero(uint8_t x) { return static_cast<uint8_t>((static_cast<uint32_t>(x) - 1) >> 31); }
+
+// Returns if two byte strings are equal in constant time
+bool ct_equal(const uint8_t* a, const uint8_t* b, size_t len) {
+    uint8_t diff = 0;
+    for(size_t i = 0; i < len; ++i)
+        diff |= a[i] ^ b[i];
+    return ct_is_zero(diff) == 1;
+}
+
+// Decrypt the masked 384 bytes data block to retrieve K
+Bytes RSA_OAEP_DECRYPT(const PrivateKey& k, const Bytes& C, const Bytes& A) {
+    const size_t nLen = (k.n.bits() + 7) / 8; // Modulus length in bytes (384)
+    if(C.size() != nLen) // Cyphertext must be 384 bytes
+        throw std::runtime_error("erroneous input");
+    BigInt c = BS2I(C);
+    if(!(c > 1 && c < k.n - 1)) // 1 < c < n - 1 
+        throw std::runtime_error("erroneous input");
+    Bytes EM = I2BS(RSADP(k, c), nLen); // Retrieve the encoded message
+    Bytes HA = sha256(A) // Hash input A (identity of both parties)
+    const uint8_t Y = EM[0]; // Obtain first byte
+    Bytes seed(EM.begin() + 1, EM.begin() + 1 + H_LEN); // obtain masked seed
+    Bytse DB(EM.begin() + 1 + H_LEN, EM.end()); // Obtain masked data block
+    xor_into(seed, MGF1(DB, H_LEN)); // XOR masked seed and MGF1 of the masked data block to obtain the seed
+    xor_into(DB, MGF1(seed, nLen - H_LEN - 1)); // XOR seed and MGF1 of the masked data block to obtain the data block
+    uint8_t bad = ct_is_zero(Y) ^ 1; // First byte should be zero
+    bad |= ct_equal(DB.data(), HA.data(), H_LEN) ? 0 : 1; // First 32 bytes of DB must equal SHA-256(A)
+    uint8_t found = 0; // 1 if the 01 before K is found
+    size_t sep = 0; // Holds 01's position in DB
+    for(size_t i = H_LEN; i < DB.size(); ++i) { // Scan every byte
+        const uint8_t is0 = ct_is_zero(DB[i]); // Check if the current byte is 00
+        const uint8_t is1 = ct_is_zero(DB[i] ^ 0x01); // Check if current bye is 01
+        const uint8_t first_one = (found ^ 1) & is1; // Check if it is the first 01
+        sep |= i & (0 - static_cast<size_t>(first_one)); // Store 01's position
+        bad |= (found ^ 1) & (is0 ^ 1) & (is1 ^ 1); // A byte that is neither 00 or 01 is an error
+        found |= is1; // After 01, every later byte is part of K
+    }
+    bad |= found ^ 1; // Not 01 found
+    if(bad != 0) // Generic error message
+        throw std::runtime_error("decryption error");
+    return Bytes(DB.begin() + sep + 1, DB.end()); // Return everything after 01
 }
 
 int main() {
