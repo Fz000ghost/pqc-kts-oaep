@@ -149,6 +149,39 @@ BigInt generate_prime(const BigInt& e, const BigInt* other) {
     }
     throw std::runtime_error("prime generation failed");
 }
+
+// Power b^k by square-and-multiply using BigInt
+BigInt int_pow(BigInt b, size_t k) {
+    BigInt r = BigInt::one();
+    while(K > 0) { // Loop until every bit of k is used
+        if(k & 1) 
+            r *= b; // Multiplies if the lowest bit is 1
+        k >>= 1; // Divide k by 2 in binary
+        if(k > 0) 
+            b *= b; // Squares b
+    }
+    return r;
+}
+
+bool is_perfect_power(const BigInt& n) {
+    for(uint32_t k : get_small_primes()) { // Only prime exponents need checking
+        if(k > n.bits() / 9) // Skip perfect powers whose base is smaller than ~= 512 since small factors were already ruled out
+            break;
+        BigInt low = BigInt::one();
+        BigInt high = BigInt::power_of_2(n.bits() / k + 1);
+        while (high - low > 1) { // Binary search to find the k-th root
+            BigInt mid = (low + high) >> 1;
+            if (int_pow(mid, k) <= n)
+                low = mid;
+            else
+                high = mid;
+        }
+        if(int_pow(low, k) == n)
+            return true; // True if the found number is the largest number whose k-th power doesn't go over n
+    }
+    return false;
+}
+
 // Least common multiple using BigInt
 BigInt bigint_lcm(const BigInt& a, const BigInt& b){
     return a * b / Botan::gcd(a, b);
@@ -336,6 +369,44 @@ Bytes RSA_OAEP_DECRYPT(const PrivateKey& k, const Bytes& C, const Bytes& A) {
     if(bad != 0) // Generic error message
         throw std::runtime_error("decryption error");
     return Bytes(DB.begin() + sep + 1, DB.end()); // Return everything after 01
+}
+
+// Party U must not encrypt a key it hasn't checked.
+std::string validate_public_key(const PublicKey& pub) {
+    if(pub.n.bits() != N_BITS) return "modulus is not 3072 bits"; // Modulus has agreed length (3072 bits)
+    if(pub.n.is_even()) return "modulus is even";
+    if(pub.e.is_even() || pub.e < 65537 || pub.e.bits() > 256) return "exponent out of range"; // Exponent is odd and in the allowed range 65537 <= e < e^256
+    for(uint32_t sp : get_small_primes()) 
+        if(sp < 752 && pub.n % sp == 0) return "modulus has a small factor"; // No prime factor below 752
+    if(miller_rabin(pub.n, 5)) return "modulus is prime"; // N must be composite. A prime modulus would make RSA breakable as φ(n) = n - 1 is public
+    if(is_perfect_power(pub.n)) return "modulus is a perfect power"; // N must not be a perfect power
+    return "";
+}
+
+// Appends a field as Datalen || Data
+void append_lv(Bytes& out, const std::string& s) {
+    put_u32(out, static_cast<uint32_t>(s.size()));
+    append(out, s);
+}
+
+// MacDataV: KC_1_V || Dv || Du || Null || C
+Bytes mac_data_V(const Bytes& C) {
+    Bytes data;
+    append(data, std::string("KC_1_V"));
+    append_lv(data, ID_V);
+    append_lv(data, ID_U);
+    append(data, C);
+    return data;
+}
+
+// MacTag = MacTagBits[HMAC-SHA-256(MacKey, MacData)]
+Bytes mac_tag(const Bytes& mac_key, const Bytes& mac_data) {
+    auto mac = Botan::MesasageAuthenticationCode::create_or_throw("HMAC(SHA-256)");
+    mac->set_key(mac_key);
+    mac->update(mac_data);
+    Bytes tag = mac->final(); 
+    tag.resize(MAC_TAG_LEN); //Keep tag as 32 bytes 
+    return tag;
 }
 
 int main() {
