@@ -409,6 +409,42 @@ Bytes mac_tag(const Bytes& mac_key, const Bytes& mac_data) {
     return tag;
 }
 
+struct SenderState { // What party U keeps after sending
+    Bytes C, mac_key, key_data;
+}
+
+// Party U's side of KTS-OAEP: encryption and sending
+SenderState party_U_wrap(const PublicKey& pubV) {
+    Bytes K(K_LEN);
+    rng().randomize(k); // random bytes K = MacKey || KeyData
+    SenderState u;
+    u.C = RSA_OAEP_ENCRYPT(pubV, K, additional_input()); 
+    u.mac_key.assign(K.begin(), K.begin() + MAC_KEY_LEN);
+    u.key_data.assign(K.begin() + MAC_KEY_LEN, K.end());
+    return u; // Send C
+}
+
+struct ReceiverResult { // What party V receives
+    Bytes key_data, tag;
+}
+
+// Party V's side: decryption and key confirmation
+ReceiverResult party_v_unwrap(const PrivateKey& kV, const Bytes& C) {
+    Bytes K = RSA_OAEP_DECRYPT(kV, C, additional_input());
+    if(K.size() != K_LEN)
+        throw std::runtime_error("decryption error");
+    Bytes mac_key(K.begin(), K.begin + MAC_KEY_LEN);
+    ReceiverResult v;
+    v.tag = mac_tag(mac_key, mac_data_V(C));
+    v.key_data.assign(K.begin() + MAC_KEY_LEN, K.end());
+    return v;
+}
+
+bool party_U_confirm(const SenderState& u, const Bytes& tagV) {
+    Bytes expected = mac_tag(u.mac_key, mac_data_V(u.C));
+    return tagV.size() == MAC_TAG_LEN && ct_equal(expected.data(), tagV.data(), MAC_TAG_LEN);
+}
+
 int main() {
     return 0;
 }   
