@@ -46,6 +46,7 @@ constexpr size_t MAC_KEY_LEN = 32; // Length of MAC key (first 32 bytes)
 constexpr size_t KEY_DATA_LEN = 32; // Length of the secret (next 32 bytes)
 constexpr size_t K_LEN = MAC_KEY_LEN + KEY_DATA_LEN; // Length of the keying material K (64 bytes)
 constexpr size_t MAC_TAG_LEN = 32; // Full HMAC-SHA-256 output (32 bytes)
+constexpr uint32_t MAX_FRAME = 4096; // No message should be larger than 384 bytes
 constexpr size_t WARMUP = 5; // First 5 runs are thrown away
 const std::string ID_U = "party-U";
 const std::string ID_V = "party-V";
@@ -432,18 +433,104 @@ struct ReceiverResult { // What party V receives
 ReceiverResult party_v_unwrap(const PrivateKey& kV, const Bytes& C) {
     Bytes K = RSA_OAEP_DECRYPT(kV, C, additional_input());
     if(K.size() != K_LEN)
-        throw std::runtime_error("decryption error");
-    Bytes mac_key(K.begin(), K.begin + MAC_KEY_LEN);
+        throw std::runtime_error("decryption error"); // On failure, party V ends the traansaction without sending anything back
+    Bytes mac_key(K.begin(), K.begin + MAC_KEY_LEN); // MacKey || KeyData == K
     ReceiverResult v;
-    v.tag = mac_tag(mac_key, mac_data_V(C));
+    v.tag = mac_tag(mac_key, mac_data_V(C)); // Only someone who decrypted C can know MacKey, so a correct tag proves V holds the private key and received the same K
     v.key_data.assign(K.begin() + MAC_KEY_LEN, K.end());
-    return v;
+    return v; // Keep KeyData
 }
 
+// Party U's confirmation of the tag
 bool party_U_confirm(const SenderState& u, const Bytes& tagV) {
-    Bytes expected = mac_tag(u.mac_key, mac_data_V(u.C));
-    return tagV.size() == MAC_TAG_LEN && ct_equal(expected.data(), tagV.data(), MAC_TAG_LEN);
+    Bytes expected = mac_tag(u.mac_key, mac_data_V(u.C)); // Recompute the tag from its own MacKey and C
+    return tagV.size() == MAC_TAG_LEN && ct_equal(expected.data(), tagV.data(), MAC_TAG_LEN); // Compares in constant time
 }
+
+// Keep sending until everything has gone out
+void send_all(int fd, const uint8_t* p, size_t n) {
+    while(n > 0) {
+        ssize_t w = ::send(fd, p, n, MSG_NOSIGNAL);
+        if(w <= 0)  // The other side might have closed the connection
+            throw std::runtime_error("send failed");
+        p += w; // Move past the bytes that went out
+        n -= static_cast<size_t>(w); // Fewer bytes left to send
+    }
+}
+
+// Keep receiving until n bytes have arrived
+bool recv_all(int fd, uint8_t* p, size_t n) {
+    size_t got = 0;
+    while(got < n) {
+        ssize_t r = ::recv(fd, p + got, n - got, 0);
+        if(r == 0 && got == 0) return false; // The other side finished and hung up
+        if(r <= 0) throw std::runtime_error("connection lost mid-message"); // Something went wrong
+        got += static_cast<size_t>(r);
+    }
+    return true;
+}
+
+// Every message starts with 4 bytes that give the payload's length
+void send_frame(int fd, const Bytes& payload) {
+    Bytes frame;
+    put_u32(frame, static_cast<uint32_t>(payload.size()));
+    append(frame, payload);
+    send_all(fd, frame.data(), frame.size());
+}
+
+// Reads exactly 4 bytes to get the length of the message
+bool recv_frame(int fd, Bytes& out) {
+    uint8_t hdr[4];
+    if(!recv_all(fd, hdr, 4)) return false;
+    const uint32_t len = (uint32_t(hdr[0]) << 24) | (uint32_t(hdr[1]) << 16) | (uint32_t(hdr[2]) << 8) | hdr[3]; // Rebuilds the length from the 4 bytes
+    if(len > MAX_FRAME) throw std::runtime_error("frame too large"); // Check length of the frame before thrusting it
+    out.resize(len);
+    if(len > 0 && !recv_all(fd, out.data(), len)) throw std::runtime_error("connection lost mid-message");
+    return true;
+}
+
+// Disable Nagle's algorithm, which holds onto small amounts of data in case more is coming, to send them on a larger packet (bad for benchmarking speed)
+void no_delay(int fd) {
+    int one = 1;
+    ::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+}
+
+// Client side
+int connect_to(const std::string& host, const std::string& port) {
+    addrinfo hints {};
+    hints.ai_family = AF_INET; // IPv4 only
+    hints.ai_socktype = SOCK_STREAM; // TCP
+    addrinfo* res = nullptr;
+    if(::getaddrinfo(host.c_str(), port.c_str(), &hints, &res) != 0) throw std::runtime_error("cannot resolve " + host);
+    int fd = ::socket(res->ai_family, res->ai_socktype, res->ai_protocol); // Creates an unconnected soccket
+    if(fd < 0 || ::connect(fd, res->ai_addr, res->ai_addrlen) != 0) { // Contacts the server
+        if(fd >= 0) ::close(fd);
+        :: freeaddrinfo(res); // Frees the memory get addrinfo allocated
+        throw std::runtime_error("cannot connect to " + host + ":" + port);
+    }
+    ::freeaddrinfo(res); // Frees the memory get addrinfo allocated
+    no_delay(fd);
+    return fd; // Return the connected socket
+}
+
+// Server side
+int listen_on(uint16_t port) {
+    int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    if(fd < 0) throw std::runtime_error(std::string("socket() failed: ") + std::strerror(errno));
+    int one = 1;
+    ::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_ANY); // Listen on every IP that the machine has
+    addr.sin_port = htons(port);
+    if(::bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0 || ::listen(fd, 1) != 0) { // Claims the port and marks the socket as a server
+        const int err = errno;
+        ::close(fd);
+        throw std::runtime_error("cannot listen on port " + std::to_string(port) + ": " + std::strerror(err)); 
+    }
+    return fd; // Returns a listening socket
+}
+
 
 int main() {
     return 0;
