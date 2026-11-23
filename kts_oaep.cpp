@@ -432,7 +432,7 @@ struct ReceiverResult { // What party V receives
 }
 
 // Party V's side: decryption and key confirmation
-ReceiverResult party_v_unwrap(const PrivateKey& kV, const Bytes& C) {
+ReceiverResult party_V_unwrap(const PrivateKey& kV, const Bytes& C) {
     Bytes K = RSA_OAEP_DECRYPT(kV, C, additional_input());
     if(K.size() != K_LEN)
         throw std::runtime_error("decryption error"); // On failure, party V ends the traansaction without sending anything back
@@ -656,7 +656,7 @@ int run_server(uint16_t port) {
             Bytes C;
             for(size_t run = 0; recv_frame(fd, C); ++run) {
                 Stopwatch t;
-                ReceiverResult v = party_v_unwrap(kV, C);
+                ReceiverResult v = party_V_unwrap(kV, C);
                 const Sample s = t.stop();
                 send_frame(fd, v.tag);
                 if(run >= WARMUP) unwrap.add(s);
@@ -670,6 +670,119 @@ int run_server(uint16_t port) {
             report_memory(mem0);
         }
     }
+}
+
+// CLIENT SIDE BENCHMARKING
+
+// Run RSA-3072 on the client side, measuring each process
+int run_client(const std::string& host, const std::string& port, size_t n_runs) {
+    const long mem0 = peak_memory_kib();
+    const int fd = connect_to(host, port);
+    Bytes nb, eb;
+    if(!recv_frame(fd, nb) || !recv_frame(fd, eb)) throw std::runtime_error("server closed before sending its public key");
+    const size_t key_bytes = 4 + nb.size() + 4 + eb.size();
+    const PublicKey pubV{BS2I(nb), BS2I(eb)};
+    Stopwatch sw;
+    const std::string problem = validate_public_key(pubV);
+    const Sample pv = sw.stop();
+    std::printf("public-key validation: %.1f ms (CPU %.1f ms)\n", pv.wall_us / 1000, pv.cpu_us / 1000);
+    if(!problem.empty()) throw std::runtime_error("refusing public key: " + problem);
+    Series wrap{"U wrap"}, rtt{"U round trip"}, confirm{"U confirm"};
+    size_t sent = 0, received = 0;
+    for(size_t run = 0; run < WARMUP + n_runs; ++run) {
+        Stopwatch t1;
+        SenderState u = party_U_wrap(pubV);
+        const Sample w = t1.stop();
+        Stopwatch t2;
+        send_frame(fd, u.C);
+        Bytes tag;
+        if(!recv_frame(fd, tag)) throw std::runtime_error("party V closed the connection: transaction failed");
+        const Sample r = t2.stop();
+        Stopwatch t3;
+        const bool ok = party_U_confirm(u, tag);
+        const Sample c = t3.stop();
+        if(!ok) throw std::runtime_error("key confirmation failed: discard the key");
+        sent += 4 + u.C.size();
+        received += 4 + tag.size();
+        if(run >= WARMUP) {
+            wrap.add(w);
+            rtt.add(r);
+            confrim.add(c);
+        }
+    }
+    ::close(fd);
+    const size_t runs = WARMUP + n_runs;
+    std::printf("%zu exchanges complreted, every key confirmed\n", n_runs);
+    report_all({&wrap, &rtt, &confirm}, "client.csv");
+    std::printf("bytes on the wire (frame headers included, TCP/IP headers not): public key % zu once, per exchange %zu sent + %zu received = %zu\n", key_bytes, sent / runs, received / runs, (sent + received) / runs);
+    report_memory(mem0);
+    return 0;
+}
+
+// LOCAL BENCHMARK
+
+// Local benchmark on one machine, with no network
+int run_bench(size_t n_runs, size_t keygen_run) {
+    const long mem0 = peak_memory_kib();
+    Series keygen{"keygen"}, validate{"validate key pair"}, kgen{"K generation"}, wrap{"U wrap (encapsulate)"}, decap{"V decapsulate"}, vtag{"V tag (HMAC)"}. unwrap{"V unwrap+tag"}, confirm{"U confirm"}, total{"exchange total"}, ref_enc{"Botan OAEP encrypt"}, ref_dec{Botan OAEP decrypt};
+    PrivateKey kV;
+    for(size_t i = 0; i < keygen_runs; ++i) {
+        Stopwatch t;
+        kV = rsakpg1_crt();
+        keygen.add(t.stop());
+        Stopwatch t2;
+        if(!rsakpv1_crt(kV.pub(), kV).empty()) throw std::runtime_error("generated key failed validation");
+        validate.add(t2.stop());
+    }
+    const PublicKey pubV 0 kV.pub();
+    Botan::RSA_PrivateKey ref_key(kV.p, kV.q, kV.e);
+    Botan::PK_Encryptor_EME ref_enc_op(ref_key, rng(), "OAEP(SHA-256)");
+    Botan::PK_Decryptor_EME ref_dec_op(ref_key, rng(), "OAEP(SHA-256)");
+    Bytes msg(K_LEN, 0x42);
+    for(size_t run = 0; run < WARMUP + n_runs; ++run) {
+        Stopwatch t0;
+        Bytes fresh(K_LEN);
+        rng().randomize(fresh);
+        const Sample g = t0.stop();
+        Stopwatch t1;
+        SenderState u = party_U_wrap(pubV);
+        const Sample w = t1.stop();
+        Stopwatch t2;
+        const Bytes K = RSA_OAEP_DECRYPT(kV, u.C, additional_input());
+        const Sample d = t2.stop();
+        const Bytes mac_key(K.begin(), K.begin() + MAC_KEY_LEN);
+        Stopwatch t3;
+        const Bytes tag = mac_tag(mac_key, mac_data_V(u.C));
+        const Sample h = t3.stop();
+        Stopwatch t4;
+        ReceiverResult v = party_V_unwrap(kV, u.C);
+        const Sample vt = t4.stop();
+        Stopwatch t5;
+        const bool ok = party_U_confirm(um v.tag);
+        const Sample c = t5.stop();
+        if(!ok || v.key_data != u.key_data || tag != v.tag || !std::equal(K.begin() + MAC_KEY_LEN, K.end(), u,key_data.begin(), u.key_data.end())) throw std::runtime_error("exchange failed");
+        Stiowatch t6;
+        auto ref_c = ref_enc_op.encrypt(msg, rng());
+        const Sample re = t6.stop();
+        Stopwatch t7;
+        auto ref_m = ref_dec_op.decrypt(ref_c);
+        const Sample rd = t7.stop();
+        if(run >= WARMUP) {
+            kgen.add(g);
+            wrap.add(w);
+            decap.add(d);
+            vtag.add(h);
+            unwarap.add(vt);
+            confirm.add(c);
+            total.add({w.wall_us + vt.wall_us + c.wall_us, w.cpu_us + vt.cpu_us + c.cpu_us});
+            ref_enc.add(re);
+            ref_dec.add(rd);
+        }
+    }
+    report_all({&keygen, &validate, &kgen, &wrap, &decap, &vtag, &unwrap, &confirm, &total, &ref_enc, &ref_dec}, "bench.csv");
+    report_sizes(pubV, party_U_wrap(pubV).C);
+    report_memory(mem0);
+    return 0;
 }
 
 int main() {
