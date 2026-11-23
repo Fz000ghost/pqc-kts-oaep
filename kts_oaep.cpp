@@ -859,6 +859,86 @@ void run_wycheproof(const std:: string& path) {
     check(total > 0 && passed == total, "Wycheproof RSA-OAEP-3072 SHA-256: " + std::to_string(passed) + "/" + std::to_string(total) + " cases");
 }
 
+// Runs every check in one place
+int run_tests(const std::string& vectors) {
+    // Conversions
+    check(I2BS(BigInt::from_u64(0x0102), 4) == hex("00000102"), "I2BS pads with leading zeros");
+    check(BS2I(hex("00000102")) == 0x0102, "BS2I reads big-endian bytes");
+    check(throws([] { I2BS(BigInt::from_u64(0x10000), 2); }), "I2BS refuses a number that does not fit")
+
+    // MGF1
+    check(MGF(text("bar"), 50) == hex("382576a7841021cc28fc4c0948753fb8312090cea942ea4c4e735d10dc724b155f9f6069f289d61daca0cb814502ef04eae1"), "MGF1-SHA-256 matches an independent implementation");
+    
+    // Primality
+    check(miller_rabin(BigInt::from_u64(65537), 20), "65537 is prime");
+    check(miller_rabin(BigInt::power_of_2(127) - 1, 20), "2^127 - 1 is prime");
+    check(!miller_rabin(BigInt::from_u64(561), 20), "561 (a Carmichael number) is composite");
+    check(!miller_rabin(BigInt::from_u64(65537) * BigInt::from_u64(65539), 20), "65537 * 65539 is composite");
+
+    // Key generation / validation
+    auto t = Clock::now();
+    const PrivateKey kV = rsakpg1_crt();
+    std::printf("       (key generation took %.0f ms)\n", micros_since(t) / 1000);
+    check(kV.n.bits() == 3072, "modulus is exactly 3072 bits");
+    check(rsakpv1_crt(kV.pub(), kV).empty(), "rsakpv1-crt accepts the generated key pair");
+    PrivateKey broken = kV;
+    broken.qInv += 1;
+    check(!rsakpv1_crt(broken.pub(), broken).empty(), "rsakpv1-crt rejects a key with a wrong qInv");
+    check(validate_public_key(kV.pub()).empty(), "party U's checks accept the public key");
+    check(!validate_public_key({kV.n + 1, kV.e}).empty(), "party U's checks reject an even modulus");
+    check(validate_public_key({kV.p * kV.p, kV.e}) == "modulus is a perfect power", "party U's checks reject n = p * p (a perfect square)");
+
+    // RSA primitives
+    const BigInt m = BigInt::random_integer(rng(), 2, kV.n - 1);
+    const BigInt c = RSAEP(kV.pub(), m);
+    check(RSADP(kV, c) == m, "RSADP(RSAEP(m)) == m");
+    check(RSADP(kV, c) == Botan::power_mod(c, kV.d, kV.n), "CRT decryption equals plain c^d mod n");
+    check(throws([&] { RSAEP(kV.pub(), BigInt::one()); }), "RSAEP refuses m = 1");
+
+    // RSA-OAEP
+    const Bytes A = additional_input();
+    const Bytes K = text("sixty-four bytes of keying material would normally be random....");
+    const Bytes C = RSA_OAEP_ENCRYPT(kV.pub(), K, A);
+    check(C.size() == 384, "ciphertext is 384 bytes");
+    check(RSA_OAEP_DECRYPT(kV, C, A) == K, "OAEP round trip recovers K");
+    check(RSA_OAEP_ENCRYPT(kV.pub(), K, A) != C, "encrypting the same K twice gives different ciphertexts");
+    check(throws([&] { RSA_OAEP_DECRYPT(kV, C, text("other")); }), "wrong additional input A is rejected");
+    Bytes C2 = C;
+    C2[100] ^= 0x01;
+    check(throws([&] { RSA_OAEP_DECRYPT(kV, C2, A); }), "one flipped ciphertext bit is rejected");
+    check(throws([&] { RSA_OAEP_ENCRYPT(kV.pub(), Bytes(319), A); }), "K longer than 318 bytes is refused");
+    check(RSA_OAEP_DECRYPT(kV, RSA_OAEP_ENCRYPT(kV.pub(), Bytes(318, 7), A), A) == Bytes(318, 7), "the longest allowed K (318 bytes) works");
+
+    // Check with Botan's RSA-OAEP
+    Botan::RSA_PrivateKey ref(kV.p, kV.q, kV.e);
+    for(const std::string label : {"", "kts-demo"}) {
+        const std::string padding = label.empty() ? "OAEP(SHA-256)" : "OAEP(SHA-256,MGF1(SHA-256)," + label + ")";
+        Botan::PK_Encryptor_EME ref_enc(ref, rng(), padding);
+        Botan::PK_Decryptor_EME ref_dec(ref, rng(), padding);
+        const Bytes ours = RSA_OAEP_ENCRYPT(kV.pub(), K, text(label));
+        check(ref_dec.decrypt(ours) == K, "Botan decrypts our ciphertext (label \"" + label + "\")");
+        const auto theirs = ref_enc.encrypt(K, rng());
+        check(RSA_OAEP_DECRYPT(kV, Bytes(theirs.begin(), theirs.end()), text(label)) == K, "we decrypt Botan's ciphertext (label \"" + label + "\")");
+    }
+
+    // Full KTS-OAEP-Party_V-confirmation exchange
+    SenderState u = party_U_wrap(kV.pub());
+    ReceiverResult v = party_V_unwrap(kV, u.C);
+    check(v.key_data == u.key_data, "both parties hold the same KeyData");
+    check(party_U_confirm(u, v.tag), "party U accepts party V's MacTag");
+    Bytes bad_tag = v.tag;
+    bad_tag[0] ^= 0x80;
+    check(!party_U_confirm(u, bad_tag), "party U rejects a modified MacTag");
+
+    // Run Wycheproof if a file was given
+    if(!vectors.empty()) {
+        run_wycheproof(vectors);
+    }
+    std::printf("%s\n", failures == 0 ? "ALL CHECKS PASSED" : "SOME CHECKS FAILED");
+    
+    return failures == 0 ? 0 : 1;
+}
+
 // Mode selection. argv holds the command-line arguments.
 int main(int argc, char**argv) {
     std::setvbuf(stdout, nullptr, _IOLBF, 0);
@@ -866,7 +946,7 @@ int main(int argc, char**argv) {
         const std::string mode = argc > 1 ? argv[1] : "";
         if(mode == "test") return run_tests(argc > 2 ? argv[2] : "");
         if(mode == "bench" && argc > 2) return run_bench(std::stoul(argv[2]), argc > 3 ? std::max <size_t>(1, std::stoul(argv[3])) : 10);
-        if(mode == "server" && argc > 2) rturn run_server(static_cast<uint16_t>(std::stoul(argv[2])));
+        if(mode == "server" && argc > 2) return run_server(static_cast<uint16_t>(std::stoul(argv[2])));
         if(mode == "client" && argc > 4) return run_client(argv[2], argv[3], std::stoul(argv[4]));
         std::fprintf(stderr, "usage: %s test [wycheproof.json] | bench <N> [keygen_run] | server <port> | client <host> <port> <N>\n", argv[0]);
         return 2;
