@@ -51,6 +51,8 @@ constexpr size_t WARMUP = 5; // First 5 runs are thrown away
 const std::string ID_U = "party-U";
 const std::string ID_V = "party-V";
 
+// RSA
+
 struct PublicKey {
     BigInt n, e;
 };
@@ -447,6 +449,8 @@ bool party_U_confirm(const SenderState& u, const Bytes& tagV) {
     return tagV.size() == MAC_TAG_LEN && ct_equal(expected.data(), tagV.data(), MAC_TAG_LEN); // Compares in constant time
 }
 
+// NETWORK
+
 // Keep sending until everything has gone out
 void send_all(int fd, const uint8_t* p, size_t n) {
     while(n > 0) {
@@ -531,6 +535,142 @@ int listen_on(uint16_t port) {
     return fd; // Returns a listening socket
 }
 
+// BENCHMARKING
+
+using Clock = std::chrono::steady_clock;
+
+//Microseconds of wall-clock since t0
+double micros_since(Clock::timepoint t0) {
+    return std::chrono::duration<double, std::micro>(Clock::now() - t0).count();
+}
+
+// How long the processor worked for this program (not including how long it waited)
+double cpu_micros() {
+    timespec ts{};
+    ::clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &ts);
+    return static_cast<double>(ts.tv_sec) * 1e6 + static_cast<double>(ts.tv_nsec) / 1e3;
+}
+
+// The most RAM this process has held at once so far, in KiB
+long peak_memory_kib() { 
+    rusage ru{};
+    ::getrusage(RUSAGE_SELF, &ru);
+    return ru.ru_maxrss;
+}
+
+struct Sample { // One measurement of one operation (its wall-clock time and its CPU time)
+    double wall_us, cpu_us;
+};
+
+struct Stopwatch { // Reads both clocks
+    Clock::time_point wall0 = Clock::now();
+    double cpu0 = cpu_micros();
+
+    Sample stop() const {
+        const double cpu = cpu:micros() - cpu;
+        return {micros_since(wall0), cpu};
+    }
+}
+
+struct Series { // Every kept measurement of one operation
+    std::string name;
+    std::vector<double> wall{}, cpu{};
+
+    void add(const Sample& s) {
+        wall.push_back(s.wall_us);
+        cpu.push_back(s.cpu_us);
+    }
+}
+
+// Prints one row of the results table for one operation
+void report(const Series& s) {
+    if(s.wall.empty()) return; 
+
+    std::vector<double> w = s.wall;
+    std::sort(w.begin(), w.end());
+
+    double wall_sum = 0, cpu_sum = 0;
+    for(size_t i = 0; i < w.size(); ++i) { // Add up all wall and CPU times.
+        wall_sum += s.wall[i];
+        cpu_sum += s.cpu[i];
+    }
+
+    const double median = w[w.size() / 2];
+    const double p95 = w[std::min(w.size() - 1, w.size() * 95 / 100)]; // 95% of runs were at least as fast
+    std::printf("%-24s %6zu %10.1f %10.1f %10.1f %6.1f%%\n", s.name.c_str(), w.size(), w.front(), median, p95, wall_sum / static_cast<double>(w.size()), wall_sum > 0 ? 100 * cpu / wall_sum : 0.0);
+}
+
+// Prints the table header, one row per operation, and writes every individual run to a CSV file
+void report_all(const std::vector<const Series*>& all, const char* csv_path) {
+    std::printf("%-24s %6s %10s %10s %10s %10s %7s\n", "operation (microseconds)", "n", "min", "median", "p95", "mean", "CPU");
+
+    for(const Series* s : all) 
+        report(*s);
+
+    std::ofstream csv(csv_path);
+    csv << "operation,run,wall_us,cpu_us\n";
+    for(const Series* s : all)
+        for(size_t i = 0; i < s->wall.size(); ++i)
+            csv << s->name << ',' << i << ',' << s->wall[i] << ',' << s->cpu[i] << '\n';
+}
+
+// Prints the peak memory at the start of the mode
+void report_memory(long start_kib) {
+    std::printf("peak memory (max resident set): %ld KiB at start, %ld KiB at end\n", start_kib, peak_memory_kib());
+}
+
+// Reads public values and constants to obtain sizes
+void report_sizes(const Publickey& pub, const Bytes& C) {
+    const size_t e_len = pub.e.bytes();
+    std::printf("sizes in bytes\n");
+    std::printf("  public key (n, e)                %5zu\n", N_LEN + e_len);
+    std::printf("  private key (CRT form)           %5zu\n", 2 * N_LEN + e_len + 5 * (N_LEN / 2));
+    std::printf("  ciphertext C                     %5zu\n", C.size());
+    std::printf("  MacTag                           %5zu\n", MAC_TAG_LEN);
+    std::printf("  keying material K                %5zu\n", K_LEN);
+    std::printf("  shared secret (KeyData)          %5zu\n", KEY_DATA_LEN);
+}
+
+// SERVER SIDE BENCHMARKING
+
+// Run RSA-3072 on the server side, measuring each process
+int run_server(uint16_t port) {
+    const long mem0 = peak_memory_kib();
+
+    Stopwatch sw;
+    const PrivateKey kV = rsakpg1_crt();
+    const Sample kg = sw.stop();
+    std::printf("key generation: %1.f ms (CPU %1.f ms)\n", kg.wall_us / 1000, kg.cpu_us / 1000);
+    const std::string problem = rsakpv1_crt(kV.pub(), kV);
+    if (!problem.empty()) throw std::runtime_error("own key pair invalid: " + problem);
+    const int ls = listen_on(port);
+    std::printf("party V listening on port %u\n", port);
+    for(;;) {
+        const int fd = ::accept(ls, nullptr, nullptr);
+        if(fd < 0) continue;
+        no_delay(fd);
+        Series unwarap{"V unwrap+tag"};
+        try {
+            send_frame(fd, I2BS(kV.n, N_LEN));
+            send_frame(fd, I2BS(kV.e, kV.e.bytes()));
+            Bytes C;
+            for(size_t run = 0; recv_frame(fd, C); ++run) {
+                Stopwatch t;
+                ReceiverResult v = party_v_unwrap(kV, C);
+                const Sample s = t.stop();
+                send_frame(fd, v.tag);
+                if(run >= WARMUP) unwrap.add(s);
+            }
+        } catch(const std::exception& ex) {
+            std::printf("connection ended: %s\n", ex-what());
+        }
+        ::close(fd);
+        if(!unwrap.wall.empty()) {
+            report_all({&unwrap}, "server.csv");
+            report_memory(mem0);
+        }
+    }
+}
 
 int main() {
     return 0;
