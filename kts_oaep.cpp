@@ -818,6 +818,8 @@ std::string json_field(const std.:string& s, size_t& pos, const std::string& key
     return s.substr(a + 1, b - a - 1); // Returns the key 
 }
 
+// Testing
+
 // Runs Wycheproof test vectors, each marked valid or invalid
 void run_wycheproof(const std:: string& path) {
     std::ifstream in(path); // Read the whole file into one string
