@@ -3,9 +3,9 @@
 // Built with Botan 3
 
 // Build: g++ -std=c++20 -O2 -Wall kts_oaep.cpp -o kts $(pkg-config --cflags --libs botan-3)
-// Run:    ./kts test [wycheproof.json]     correctness checks -NOT IMPLEMENTED-
-//         ./kts bench <N> [keygen_runs]    local timings, writes bench.csv -NOT IMPLEMENTED-
-//         ./kts server <port>              party V: owns the RSA key, receives the secret
+// Run:    ./kts test [wycheproof.json]     correctness checks
+//         ./kts bench <N> [keygen_runs]    local timings, writes bench.csv
+//         ./kts server <port>              party V: owns the RSA key, receives the secret, writes server.csv
 //         ./kts client <host> <port> <N>   party U: wraps N secrets, writes client.csv
 
 // Botan
@@ -23,17 +23,21 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <sys/socket.h>
+#include <sys/resource.h>
 #include <unistd.h>
 
 // Standard C++
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
+#include <cerrno>
 #include <cstdio>
+#include <ctime>
 #include <fstream>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <cstring>
 #include <vector>
 
 using Botan::BigInt;
@@ -89,7 +93,7 @@ const std::vector<uint32_t>& get_small_primes() {
     return primes;
 }
 
-// Check whether if a large number is prime using modular arithmetic 
+// Check whether a large number is prime using modular arithmetic 
 bool miller_rabin(const BigInt& w, size_t rounds) {
     if(w < 5)
         return w == 2 || w == 3;
@@ -144,7 +148,7 @@ BigInt generate_prime(const BigInt& e, const BigInt* other) {
         if(p * p <= lower_sq)
             continue; // P is too small, so n would be 3071 bits
         if(other != nullptr && (p - *other).abs() <= min_gap) 
-            continue; // Primes are to close to each other
+            continue; // Primes are too close to each other
         if(Botan::gcd(p-1, e) != 1)
             continue; // e must be invertible mod p - 1
         if(is_probable_prime(p,5))
@@ -156,7 +160,7 @@ BigInt generate_prime(const BigInt& e, const BigInt* other) {
 // Power b^k by square-and-multiply using BigInt
 BigInt int_pow(BigInt b, size_t k) {
     BigInt r = BigInt::one();
-    while(K > 0) { // Loop until every bit of k is used
+    while(k > 0) { // Loop until every bit of k is used
         if(k & 1) 
             r *= b; // Multiplies if the lowest bit is 1
         k >>= 1; // Divide k by 2 in binary
@@ -188,6 +192,24 @@ bool is_perfect_power(const BigInt& n) {
 // Least common multiple using BigInt
 BigInt bigint_lcm(const BigInt& a, const BigInt& b){
     return a * b / Botan::gcd(a, b);
+}
+
+// Converts an integer into base 256 with exactly 4 digits (4 big-endian bytes)
+void put_u32(Bytes& out, uint32_t v) { 
+    for(int shift = 24; shift >= 0; shift -= 8)
+        out.push_back(static_cast<uint8_t>(v >> shift));
+}
+
+// Concatenate a bytes string onto the end of the first
+void append(Bytes& out, const Bytes& b) { out.insert(out.end(), b.begin(), b.end()); } 
+
+ // Concatenate a string (ASCII to bytes) onto the end of a byte string
+void append(Bytes& out, const std::string& s) { out.insert(out.end(), s.begin(), s.end()); }
+
+// XOR two equal length byte strings
+void xor_into(Bytes& a, const Bytes& b) { 
+    for(size_t i = 0; i < a.size(); ++i)
+        a[i] ^= b[i]; // Writes the result on the first string
 }
 
 //Hashes a byte string with SHA-256
@@ -289,28 +311,10 @@ Bytes I2BS(const BigInt& x, size_t len) {
 // Convert a byte string into an integer (BigInt)
 BigInt BS2I(const Bytes& b) { return BigInt(b.data(), b.size()); } 
 
-// Converts an integer into base 256 with exactly 4 digits (4 big-endian bytes)
-void put_u32(Bytes& out, uint32_t v) { 
-    for(int shift = 24; shift >= 0; shift -= 8)
-        out.push_back(static_cast<uint8_t>(v >> shift));
-}
-
-// Concatenate a bytes string onto the end of the first
-void append(Bytes& out, const Bytes& b) { out.insert(out.end(), b.begin(), b.end()); } 
-
- // Concatenate a string (ASCII to bytes) onto the end of a byte string
-void append(Bytes& out, const std::string& s) { out.insert(out.end(), s.begin(), s.end()); }
-
-// XOR two equal length byte strings
-void xor_into(Bytes& a, const Bytes& b) { 
-    for(size_t i = 0; i < a.size(); ++i)
-        a[i] ^= b[i]; // Writes the result on the first string
-}
-
-// Turns keying materiak K into a 384 byte (3072 bits) block
+// Turns keying material K into a 384 byte (3072 bits) block
 Bytes RSA_OAEP_ENCRYPT(const PublicKey& pub, const Bytes& K, const Bytes& A) {
     const size_t nLen = (pub.n.bits() + 7) / 8; // Modulus length in bytes (384)
-    if(K.size() > nLen - 2 * H_LEN - 2) // K is too long to fit on the keying material (max 318 bytes, since H_LEN is 32)
+    if(K.size() > nLen - 2 * H_LEN - 2) // K is too long to fit in the encoded block (max 318 bytes, since H_LEN is 32)
         throw std::runtime_error("keying material too long");
     Bytes HA = sha256(A); // Hashes A, the identity of both parties
     Bytes DB = HA; // Builds the data block starting with the hash
@@ -320,9 +324,9 @@ Bytes RSA_OAEP_ENCRYPT(const PublicKey& pub, const Bytes& K, const Bytes& A) {
     Bytes mgfSeed(H_LEN); 
     rng().randomize(mgfSeed); // Create a new random 32-byte seed to use as a mask
     Bytes maskedDB = DB;
-    xor_into(maskedDB, MGF1(mgfSeed), nLen - H_LEN - 1); // XOR the DB with the seed using MGF1
+    xor_into(maskedDB, MGF1(mgfSeed, nLen - H_LEN - 1)); // XOR the DB with the seed using MGF1
     Bytes maskedSeed = mgfSeed;
-    xor_into(maskedSeed, MGF1(maskedDB, H_LEN)); // XOR the masked seed with the masked database using MGF1
+    xor_into(maskedSeed, MGF1(maskedDB, H_LEN)); // XOR the masked seed with the masked data block using MGF1
     Bytes EM{0x00};
     append(EM, maskedSeed);
     append(EM, maskedDB); // Encoded message = 00 | maskedSeed | maskedDB = 384 bytes
@@ -350,25 +354,25 @@ Bytes RSA_OAEP_DECRYPT(const PrivateKey& k, const Bytes& C, const Bytes& A) {
     if(!(c > 1 && c < k.n - 1)) // 1 < c < n - 1 
         throw std::runtime_error("erroneous input");
     Bytes EM = I2BS(RSADP(k, c), nLen); // Retrieve the encoded message
-    Bytes HA = sha256(A) // Hash input A (identity of both parties)
+    Bytes HA = sha256(A); // Hash input A (identity of both parties)
     const uint8_t Y = EM[0]; // Obtain first byte
     Bytes seed(EM.begin() + 1, EM.begin() + 1 + H_LEN); // obtain masked seed
-    Bytse DB(EM.begin() + 1 + H_LEN, EM.end()); // Obtain masked data block
+    Bytes DB(EM.begin() + 1 + H_LEN, EM.end()); // Obtain masked data block
     xor_into(seed, MGF1(DB, H_LEN)); // XOR masked seed and MGF1 of the masked data block to obtain the seed
-    xor_into(DB, MGF1(seed, nLen - H_LEN - 1)); // XOR seed and MGF1 of the masked data block to obtain the data block
+    xor_into(DB, MGF1(seed, nLen - H_LEN - 1)); // DB is recovered as maskedDB XOR MGF1(seed)
     uint8_t bad = ct_is_zero(Y) ^ 1; // First byte should be zero
     bad |= ct_equal(DB.data(), HA.data(), H_LEN) ? 0 : 1; // First 32 bytes of DB must equal SHA-256(A)
     uint8_t found = 0; // 1 if the 01 before K is found
     size_t sep = 0; // Holds 01's position in DB
     for(size_t i = H_LEN; i < DB.size(); ++i) { // Scan every byte
         const uint8_t is0 = ct_is_zero(DB[i]); // Check if the current byte is 00
-        const uint8_t is1 = ct_is_zero(DB[i] ^ 0x01); // Check if current bye is 01
+        const uint8_t is1 = ct_is_zero(DB[i] ^ 0x01); // Check if current byte is 01
         const uint8_t first_one = (found ^ 1) & is1; // Check if it is the first 01
         sep |= i & (0 - static_cast<size_t>(first_one)); // Store 01's position
         bad |= (found ^ 1) & (is0 ^ 1) & (is1 ^ 1); // A byte that is neither 00 or 01 is an error
         found |= is1; // After 01, every later byte is part of K
     }
-    bad |= found ^ 1; // Not 01 found
+    bad |= found ^ 1; // No 01 found
     if(bad != 0) // Generic error message
         throw std::runtime_error("decryption error");
     return Bytes(DB.begin() + sep + 1, DB.end()); // Return everything after 01
@@ -378,7 +382,7 @@ Bytes RSA_OAEP_DECRYPT(const PrivateKey& k, const Bytes& C, const Bytes& A) {
 std::string validate_public_key(const PublicKey& pub) {
     if(pub.n.bits() != N_BITS) return "modulus is not 3072 bits"; // Modulus has agreed length (3072 bits)
     if(pub.n.is_even()) return "modulus is even";
-    if(pub.e.is_even() || pub.e < 65537 || pub.e.bits() > 256) return "exponent out of range"; // Exponent is odd and in the allowed range 65537 <= e < e^256
+    if(pub.e.is_even() || pub.e < 65537 || pub.e.bits() > 256) return "exponent out of range"; // Exponent is odd and in the allowed range 65537 <= e < 2^256
     for(uint32_t sp : get_small_primes()) 
         if(sp < 752 && pub.n % sp == 0) return "modulus has a small factor"; // No prime factor below 752
     if(miller_rabin(pub.n, 5)) return "modulus is prime"; // N must be composite. A prime modulus would make RSA breakable as φ(n) = n - 1 is public
@@ -392,7 +396,15 @@ void append_lv(Bytes& out, const std::string& s) {
     append(out, s);
 }
 
-// MacDataV: KC_1_V || Dv || Du || Null || C
+// Context that both sides know and that gets bound into the ciphertext through HA
+Bytes additional_input() {
+    Bytes A;
+    append_lv(A, ID_U);
+    append_lv(A, ID_V);
+    return A;
+}
+
+// MacDataV: KC_1_V || ID_V || ID_U || Null || C
 Bytes mac_data_V(const Bytes& C) {
     Bytes data;
     append(data, std::string("KC_1_V"));
@@ -404,7 +416,7 @@ Bytes mac_data_V(const Bytes& C) {
 
 // MacTag = MacTagBits[HMAC-SHA-256(MacKey, MacData)]
 Bytes mac_tag(const Bytes& mac_key, const Bytes& mac_data) {
-    auto mac = Botan::MesasageAuthenticationCode::create_or_throw("HMAC(SHA-256)");
+    auto mac = Botan::MessageAuthenticationCode::create_or_throw("HMAC(SHA-256)");
     mac->set_key(mac_key);
     mac->update(mac_data);
     Bytes tag = mac->final(); 
@@ -414,12 +426,12 @@ Bytes mac_tag(const Bytes& mac_key, const Bytes& mac_data) {
 
 struct SenderState { // What party U keeps after sending
     Bytes C, mac_key, key_data;
-}
+};
 
 // Party U's side of KTS-OAEP: encryption and sending
 SenderState party_U_wrap(const PublicKey& pubV) {
     Bytes K(K_LEN);
-    rng().randomize(k); // random bytes K = MacKey || KeyData
+    rng().randomize(K); // random bytes K = MacKey || KeyData
     SenderState u;
     u.C = RSA_OAEP_ENCRYPT(pubV, K, additional_input()); 
     u.mac_key.assign(K.begin(), K.begin() + MAC_KEY_LEN);
@@ -429,14 +441,14 @@ SenderState party_U_wrap(const PublicKey& pubV) {
 
 struct ReceiverResult { // What party V receives
     Bytes key_data, tag;
-}
+};
 
 // Party V's side: decryption and key confirmation
 ReceiverResult party_V_unwrap(const PrivateKey& kV, const Bytes& C) {
     Bytes K = RSA_OAEP_DECRYPT(kV, C, additional_input());
     if(K.size() != K_LEN)
-        throw std::runtime_error("decryption error"); // On failure, party V ends the traansaction without sending anything back
-    Bytes mac_key(K.begin(), K.begin + MAC_KEY_LEN); // MacKey || KeyData == K
+        throw std::runtime_error("decryption error"); // On failure, party V ends the transaction without sending anything back
+    Bytes mac_key(K.begin(), K.begin() + MAC_KEY_LEN); // MacKey || KeyData == K
     ReceiverResult v;
     v.tag = mac_tag(mac_key, mac_data_V(C)); // Only someone who decrypted C can know MacKey, so a correct tag proves V holds the private key and received the same K
     v.key_data.assign(K.begin() + MAC_KEY_LEN, K.end());
@@ -487,7 +499,7 @@ bool recv_frame(int fd, Bytes& out) {
     uint8_t hdr[4];
     if(!recv_all(fd, hdr, 4)) return false;
     const uint32_t len = (uint32_t(hdr[0]) << 24) | (uint32_t(hdr[1]) << 16) | (uint32_t(hdr[2]) << 8) | hdr[3]; // Rebuilds the length from the 4 bytes
-    if(len > MAX_FRAME) throw std::runtime_error("frame too large"); // Check length of the frame before thrusting it
+    if(len > MAX_FRAME) throw std::runtime_error("frame too large"); // Check length of the frame before trusting it
     out.resize(len);
     if(len > 0 && !recv_all(fd, out.data(), len)) throw std::runtime_error("connection lost mid-message");
     return true;
@@ -506,7 +518,7 @@ int connect_to(const std::string& host, const std::string& port) {
     hints.ai_socktype = SOCK_STREAM; // TCP
     addrinfo* res = nullptr;
     if(::getaddrinfo(host.c_str(), port.c_str(), &hints, &res) != 0) throw std::runtime_error("cannot resolve " + host);
-    int fd = ::socket(res->ai_family, res->ai_socktype, res->ai_protocol); // Creates an unconnected soccket
+    int fd = ::socket(res->ai_family, res->ai_socktype, res->ai_protocol); // Creates an unconnected socket
     if(fd < 0 || ::connect(fd, res->ai_addr, res->ai_addrlen) != 0) { // Contacts the server
         if(fd >= 0) ::close(fd);
         :: freeaddrinfo(res); // Frees the memory get addrinfo allocated
@@ -540,7 +552,7 @@ int listen_on(uint16_t port) {
 using Clock = std::chrono::steady_clock;
 
 //Microseconds of wall-clock since t0
-double micros_since(Clock::timepoint t0) {
+double micros_since(Clock::time_point t0) {
     return std::chrono::duration<double, std::micro>(Clock::now() - t0).count();
 }
 
@@ -566,7 +578,7 @@ struct Stopwatch { // Reads both clocks
     Clock::time_point wall0 = Clock::now();
     double cpu0 = cpu_micros();
     Sample stop() const {
-        const double cpu = cpu:micros() - cpu; 
+        const double cpu = cpu_micros() - cpu0; 
         return {micros_since(wall0), cpu};
     }
 };
@@ -584,7 +596,7 @@ struct Series { // Every kept measurement of one operation
 void report(const Series& s) {
     if(s.wall.empty()) return; 
     std::vector<double> w = s.wall;
-    std::sort(w.begin(), w.end()); // Sprt a copy of the wall times (smallest first, median in the middle and 95th percentile 95% og the way along)
+    std::sort(w.begin(), w.end()); // Sort a copy of the wall times (smallest first, median in the middle and 95th percentile 95% of the way along)
     double wall_sum = 0, cpu_sum = 0;
     for(size_t i = 0; i < w.size(); ++i) { // Add up all wall and CPU times.
         wall_sum += s.wall[i];
@@ -592,7 +604,7 @@ void report(const Series& s) {
     }
     const double median = w[w.size() / 2];
     const double p95 = w[std::min(w.size() - 1, w.size() * 95 / 100)]; // 95% of runs were at least as fast
-    std::printf("%-24s %6zu %10.1f %10.1f %10.1f %6.1f%%\n", s.name.c_str(), w.size(), w.front(), median, p95, wall_sum / static_cast<double>(w.size()), wall_sum > 0 ? 100 * cpu / wall_sum : 0.0);
+    std::printf("%-24s %6zu %10.1f %10.1f %10.1f %10.1f %6.1f%%\n", s.name.c_str(), w.size(), w.front(), median, p95, wall_sum / static_cast<double>(w.size()), wall_sum > 0 ? 100 * cpu_sum / wall_sum : 0.0);
 }
 
 // Prints the table header, one row per operation, and writes every individual run to a CSV file
@@ -613,7 +625,7 @@ void report_memory(long start_kib) {
 }
 
 // Reads public values and constants to obtain sizes
-void report_sizes(const Publickey& pub, const Bytes& C) {
+void report_sizes(const PublicKey& pub, const Bytes& C) {
     const size_t e_len = pub.e.bytes();
     std::printf("sizes in bytes\n");
     std::printf("  public key (n, e)                %5zu\n", N_LEN + e_len);
@@ -632,16 +644,16 @@ int run_server(uint16_t port) {
     Stopwatch sw; // Generate V's key pair once and report how long it took
     const PrivateKey kV = rsakpg1_crt();
     const Sample kg = sw.stop();
-    std::printf("key generation: %1.f ms (CPU %1.f ms)\n", kg.wall_us / 1000, kg.cpu_us / 1000);
+    std::printf("key generation: %.1f ms (CPU %.1f ms)\n", kg.wall_us / 1000, kg.cpu_us / 1000);
     const std::string problem = rsakpv1_crt(kV.pub(), kV); // Validate our own key before offering it
     if (!problem.empty()) throw std::runtime_error("own key pair invalid: " + problem);
     const int ls = listen_on(port); // Start listening on the chosen port
     std::printf("party V listening on port %u\n", port);
     for(;;) { // Serve one party U at a time until stopped
-        const int fd = ::accept(ls, nullptr, nullptr); // Wait untily party U connects. Returns a new socket for this conversation
+        const int fd = ::accept(ls, nullptr, nullptr); // Wait until party U connects. Returns a new socket for this conversation
         if(fd < 0) continue;
         no_delay(fd);
-        Series unwarap{"V unwrap+tag"};
+        Series unwrap{"V unwrap+tag"};
         try {
             // Message 1 is the public key (n, e)
             send_frame(fd, I2BS(kV.n, N_LEN));
@@ -655,7 +667,7 @@ int run_server(uint16_t port) {
                 if(run >= WARMUP) unwrap.add(s); // Skip warm-up runs
             }
         } catch(const std::exception& ex) {
-            std::printf("connection ended: %s\n", ex-what()); // Report and end the connection if something goes wrong
+            std::printf("connection ended: %s\n", ex.what()); // Report and end the connection if something goes wrong
         }
         ::close(fd);
         if(!unwrap.wall.empty()) { // A failed connection must not overwrite the last server.csv
@@ -696,21 +708,21 @@ int run_client(const std::string& host, const std::string& port, size_t n_runs) 
         Stopwatch t3; // Recompute and compare the tag
         const bool ok = party_U_confirm(u, tag);
         const Sample c = t3.stop();
-        if(!ok) throw std::runtime_error("key confirmation failed: discard the key"); // A wrong tag means U must disscard the key
+        if(!ok) throw std::runtime_error("key confirmation failed: discard the key"); // A wrong tag means U must discard the key
         // Count message 2 and message 3
         sent += 4 + u.C.size();
         received += 4 + tag.size();
         if(run >= WARMUP) { // Keep the three samples, skipping warm-up runs
             wrap.add(w);
             rtt.add(r);
-            confrim.add(c);
+            confirm.add(c);
         }
     }
     ::close(fd); // Closes the connection
     const size_t runs = WARMUP + n_runs;
-    std::printf("%zu exchanges complreted, every key confirmed\n", n_runs);
+    std::printf("%zu exchanges completed, every key confirmed\n", n_runs);
     report_all({&wrap, &rtt, &confirm}, "client.csv"); // Print the table and write client.csv
-    std::printf("bytes on the wire (frame headers included, TCP/IP headers not): public key % zu once, per exchange %zu sent + %zu received = %zu\n", key_bytes, sent / runs, received / runs, (sent + received) / runs); // Print bytes per exchange
+    std::printf("bytes on the wire (frame headers included, TCP/IP headers not): public key %zu once, per exchange %zu sent + %zu received = %zu\n", key_bytes, sent / runs, received / runs, (sent + received) / runs); // Print bytes per exchange
     report_memory(mem0); // Print peak memory
     return 0;
 }
@@ -718,10 +730,10 @@ int run_client(const std::string& host, const std::string& port, size_t n_runs) 
 // LOCAL BENCHMARK
 
 // Local benchmark on one machine, with no network
-int run_bench(size_t n_runs, size_t keygen_run) {
+int run_bench(size_t n_runs, size_t keygen_runs) {
     const long mem0 = peak_memory_kib(); // Baseline peak memory
     // One Series per measured operation
-    Series keygen{"keygen"}, validate{"validate key pair"}, kgen{"K generation"}, wrap{"U wrap (encapsulate)"}, decap{"V decapsulate"}, vtag{"V tag (HMAC)"}. unwrap{"V unwrap+tag"}, confirm{"U confirm"}, total{"exchange total"}, ref_enc{"Botan OAEP encrypt"}, ref_dec{Botan OAEP decrypt};
+    Series keygen{"keygen"}, validate{"validate key pair"}, kgen{"K generation"}, wrap{"U wrap (encapsulate)"}, decap{"V decapsulate"}, vtag{"V tag (HMAC)"}, unwrap{"V unwrap+tag"}, confirm{"U confirm"}, total{"exchange total"}, ref_enc{"Botan OAEP encrypt"}, ref_dec{"Botan OAEP decrypt"};
     PrivateKey kV; // Key used for the rest of the benchmark
     for(size_t i = 0; i < keygen_runs; ++i) { // Key generation gets its own repeat count, as it varies a lot from run to run
         Stopwatch t;
@@ -731,7 +743,7 @@ int run_bench(size_t n_runs, size_t keygen_run) {
         if(!rsakpv1_crt(kV.pub(), kV).empty()) throw std::runtime_error("generated key failed validation");
         validate.add(t2.stop());
     }
-    const PublicKey pubV 0 kV.pub(); // Party U's copy of the public key
+    const PublicKey pubV = kV.pub(); // Party U's copy of the public key
     // Botan's own OAEP on the same key as a baseline to compare against
     Botan::RSA_PrivateKey ref_key(kV.p, kV.q, kV.e);
     Botan::PK_Encryptor_EME ref_enc_op(ref_key, rng(), "OAEP(SHA-256)");
@@ -756,10 +768,10 @@ int run_bench(size_t n_runs, size_t keygen_run) {
         ReceiverResult v = party_V_unwrap(kV, u.C);
         const Sample vt = t4.stop();
         Stopwatch t5; // Party U checks the tag
-        const bool ok = party_U_confirm(um v.tag);
+        const bool ok = party_U_confirm(u, v.tag);
         const Sample c = t5.stop();
         // Verify the tag is accepted, both sides hold the same KeyData, the separately computed tag equals V's, and the separately decapsulated K carries the same KeyData
-        if(!ok || v.key_data != u.key_data || tag != v.tag || !std::equal(K.begin() + MAC_KEY_LEN, K.end(), u,key_data.begin(), u.key_data.end())) throw std::runtime_error("exchange failed");
+        if(!ok || v.key_data != u.key_data || tag != v.tag || !std::equal(K.begin() + MAC_KEY_LEN, K.end(), u.key_data.begin(), u.key_data.end())) throw std::runtime_error("exchange failed");
         // Botan's OAEP encryption and decryption of the test message
         Stopwatch t6;
         auto ref_c = ref_enc_op.encrypt(msg, rng());
@@ -772,7 +784,7 @@ int run_bench(size_t n_runs, size_t keygen_run) {
             wrap.add(w);
             decap.add(d);
             vtag.add(h);
-            unwarap.add(vt);
+            unwrap.add(vt);
             confirm.add(c);
             total.add({w.wall_us + vt.wall_us + c.wall_us, w.cpu_us + vt.cpu_us + c.cpu_us});
             ref_enc.add(re);
@@ -790,7 +802,7 @@ int run_bench(size_t n_runs, size_t keygen_run) {
 int failures = 0; // Counts failed checks. The program exits with code 1 if any failed
 
 // Prints PASS or FAIL with a description
-void check(bool ok, const std.:string& what) {
+void check(bool ok, const std::string& what) {
     std::printf("[%s] %s\n", ok ? "PASS" : "FAIL", what.c_str());
     if(!ok) ++failures;
 }
@@ -809,13 +821,13 @@ Bytes hex(const std::string& s) { return Botan::hex_decode_locked(s); }
 Bytes text(const std::string& s) { return Bytes(s.begin(), s.end()); }
 
 // Reads the string value of "key" at or after pos, and moves pos past it
-std::string json_field(const std.:string& s, size_t& pos, const std::string& key) {
+std::string json_field(const std::string& s, size_t& pos, const std::string& key) {
     const size_t k = s.find("\"" + key + "\"", pos);
     if(k == std::string::npos) throw std::runtime_error("missing JSON field " + key);
     const size_t a = s.find('"', s.find(':', k) + 1);
     const size_t b = s.find('"', a + 1);
     pos = b + 1; // Update position
-    return s.substr(a + 1, b - a - 1); // Returns the key 
+    return s.substr(a + 1, b - a - 1); // Returns the field's value 
 }
 
 // TESTING
@@ -841,17 +853,17 @@ void run_wycheproof(const std:: string& path) {
     k.dQ = BS2I(hex(json_field(s, pos, "exponent2")));
     k.qInv = BS2I(hex(json_field(s, pos, "coefficient")));
     int passed = 0, total = 0;
-    while((pos = s.find("\"tcId\"", pos)) != std.:string::npos) { // Visit each test case in turn by searching for the next "tcld"
+    while((pos = s.find("\"tcId\"", pos)) != std::string::npos) { // Visit each test case in turn by searching for the next tcId
         const int id = std::stoi(s.substr(s.find(':', pos) + 1));
-        const Bytes msg = hex(json_fied(s, pos, "msg"));
-        const Bytes ct = hex(json_fied(s, pos, "ct"));
+        const Bytes msg = hex(json_field(s, pos, "msg"));
+        const Bytes ct = hex(json_field(s, pos, "ct"));
         const Bytes label = hex(json_field(s, pos, "label"));
         const bool valid = json_field(s, pos, "result") != "invalid";
         bool ok;
         try { // A valid case must decrypt to exactly msg
             const Bytes out = RSA_OAEP_DECRYPT(k, ct, label);
             ok = valid && out == msg;
-        } catch(const std::exception&) { // If it decrypts to anything at all, the test fails
+        } catch(const std::exception&) { // If the decryption threw anything at all, the test fails
             ok = !valid;
         }
         ++total;
@@ -866,9 +878,9 @@ int run_tests(const std::string& vectors) {
     // Conversions
     check(I2BS(BigInt::from_u64(0x0102), 4) == hex("00000102"), "I2BS pads with leading zeros");
     check(BS2I(hex("00000102")) == 0x0102, "BS2I reads big-endian bytes");
-    check(throws([] { I2BS(BigInt::from_u64(0x10000), 2); }), "I2BS refuses a number that does not fit")
+    check(throws([] { I2BS(BigInt::from_u64(0x10000), 2); }), "I2BS refuses a number that does not fit");
     // MGF1
-    check(MGF(text("bar"), 50) == hex("382576a7841021cc28fc4c0948753fb8312090cea942ea4c4e735d10dc724b155f9f6069f289d61daca0cb814502ef04eae1"), "MGF1-SHA-256 matches an independent implementation");
+    check(MGF1(text("bar"), 50) == hex("382576a7841021cc28fc4c0948753fb8312090cea942ea4c4e735d10dc724b155f9f6069f289d61daca0cb814502ef04eae1"), "MGF1-SHA-256 matches an independent implementation");
     // Primality
     check(miller_rabin(BigInt::from_u64(65537), 20), "65537 is prime");
     check(miller_rabin(BigInt::power_of_2(127) - 1, 20), "2^127 - 1 is prime");
@@ -942,7 +954,7 @@ int main(int argc, char**argv) {
         if(mode == "bench" && argc > 2) return run_bench(std::stoul(argv[2]), argc > 3 ? std::max <size_t>(1, std::stoul(argv[3])) : 10);
         if(mode == "server" && argc > 2) return run_server(static_cast<uint16_t>(std::stoul(argv[2])));
         if(mode == "client" && argc > 4) return run_client(argv[2], argv[3], std::stoul(argv[4]));
-        std::fprintf(stderr, "usage: %s test [wycheproof.json] | bench <N> [keygen_run] | server <port> | client <host> <port> <N>\n", argv[0]);
+        std::fprintf(stderr, "usage: %s test [wycheproof.json] | bench <N> [keygen_runs] | server <port> | client <host> <port> <N>\n", argv[0]);
         return 2;
     } catch(const std::exception& ex) {
         std::fprintf(stderr, "error: %s\n", ex.what());
