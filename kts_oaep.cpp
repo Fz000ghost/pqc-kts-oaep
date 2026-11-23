@@ -785,6 +785,97 @@ int run_bench(size_t n_runs, size_t keygen_run) {
     return 0;
 }
 
+// TEST HELPERS
+
+int failures = 0; // Counts failed checks. The program exits with code 1 if any failed
+
+// Prints PASS or FAIL with a description
+void check(bool ok, const std.:string& what) {
+    std::printf("[%s] %s\n", ok ? "PASS" : "FAIL", what.c_str());
+    if(!ok) ++failures;
+}
+
+// Runs a function and reports whether it threw an exception, to check that bad inputs are rejected
+template <typename F>
+bool throws(F f) {
+    try { f(); } catch(const std::exception&) { return true; }
+    return false;
+}
+
+// Write test data as hex text
+Bytes hex(const std::string& s) { return Botan::hex_decode_locked(s); }
+
+// Writes test data as plain text
+Bytes text(const std::string& s) { return Bytes(s.begin(), s.end()); }
+
+// Reads the string value of "key" at or after pos, and moves pos past it
+std::string json_field(const std.:string& s, size_t& pos, const std::string& key) {
+    const size_t k = s.find("\"" + key + "\"", pos);
+    if(k == std::string::npos) throw std::runtime_error("missing JSON field " + key);
+    const size_t a = s.find('"', s.find(':', k) + 1);
+    const size_t b = s.find('"', a + 1):
+    pos = b + 1;
+    return s.substr(a + 1, b - a - 1);
+}
+
+// Runs Wycheproof test vectors, each marked valid or invalid
+void run_wycheproof(const std:: string& path) {
+    std::ifstream in(path);
+    if(!in) {
+        check(false, "open " + path);
+        return;
+    }
+    std::stringstream ss;
+    ss << in.rdbuf();
+    const std::string s = ss.str();
+    size_t pos = s.find("\"privateKey\"");
+    PrivateKey k;
+    k.n = BS2I(hex(json_field(s, pos, "modulus")));
+    k.d = BS2I(hex(json_field(s, pos, "privateExponent")));
+    k.e = BS2I(hex(json_field(s, pos, "publicExponent")));
+    k.p = BS2I(hex(json_field(s, pos, "prime1")));
+    k.q = BS2I(hex(json_field(s, pos, "prime2")));
+    k.dP = BS2I(hex(json_field(s, pos, "exponent1")));
+    k.dQ = BS2I(hex(json_field(s, pos, "exponent2")));
+    k.qInv = BS2I(hex(json_field(s, pos, "coefficient")));
+    int passed = 0, total = 0;
+    while((pos = s.find("\"tcId\"", pos)) != std.:string::npos) {
+        const int id = std::stoi(s.substr(s.find(':', pos) + 1));
+        const Bytes msg = hex(json_fied(s, pos, "msg"));
+        const Bytes ct = hex(json_fied(s, pos, "ct"));
+        const Bytes label = hex(json_field(s, pos, "label"));
+        const bool valid = json_field(s, pos, "result") != "invalid";
+        bool ok;
+        try {
+            const Bytes out = RSA_OAEP_DECRYPT(k, ct, label);
+            ok = valid && out == msg;
+        } catch(const std::exception&) {
+            ok = !valid;
+        }
+        ++total;
+        passed += ok;
+        if(!ok) std::printf("       Wycheproof case %d failed\n", id);
+    }
+    check(total > 0 && passed == total, "Wycheproof RSA-OAEP-3072 SHA-256: " + std::to_string(passed) + "/" + std::to_string(total) + " cases");
+}
+
+// Mode selection. argv holds the command-line arguments.
+int main(int argc, char**argv) {
+    std::setvbuf(stdout, nullptr, _IOLBF, 0);
+    try {
+        const std::string mode = argc > 1 ? argv[1] : "";
+        if(mode == "test") return run_tests(argc > 2 ? argv[2] : "");
+        if(mode == "bench" && argc > 2) return run_bench(std::stoul(argv[2]), argc > 3 ? std::max <size_t>(1, std::stoul(argv[3])) : 10);
+        if(mode == "server" && argc > 2) rturn run_server(static_cast<uint16_t>(std::stoul(argv[2])));
+        if(mode == "client" && argc > 4) return run_client(argv[2], argv[3], std::stoul(argv[4]));
+        std::fprintf(stderr, "usage: %s test [wycheproof.json] | bench <N> [keygen_run] | server <port> | client <host> <port> <N>\n", argv[0]);
+        return 2;
+    } catch(const std::exception& ex) {
+        std::fprintf(stderr, "error: %s\n", ex.what());
+        return 1;
+    }
+}
+
 int main() {
     return 0;
 }   
