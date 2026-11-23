@@ -565,36 +565,31 @@ struct Sample { // One measurement of one operation (its wall-clock time and its
 struct Stopwatch { // Reads both clocks
     Clock::time_point wall0 = Clock::now();
     double cpu0 = cpu_micros();
-
     Sample stop() const {
-        const double cpu = cpu:micros() - cpu;
+        const double cpu = cpu:micros() - cpu; 
         return {micros_since(wall0), cpu};
     }
-}
+};
 
 struct Series { // Every kept measurement of one operation
     std::string name;
     std::vector<double> wall{}, cpu{};
-
     void add(const Sample& s) {
         wall.push_back(s.wall_us);
         cpu.push_back(s.cpu_us);
     }
-}
+};
 
 // Prints one row of the results table for one operation
 void report(const Series& s) {
     if(s.wall.empty()) return; 
-
     std::vector<double> w = s.wall;
-    std::sort(w.begin(), w.end());
-
+    std::sort(w.begin(), w.end()); // Sprt a copy of the wall times (smallest first, median in the middle and 95th percentile 95% og the way along)
     double wall_sum = 0, cpu_sum = 0;
     for(size_t i = 0; i < w.size(); ++i) { // Add up all wall and CPU times.
         wall_sum += s.wall[i];
         cpu_sum += s.cpu[i];
     }
-
     const double median = w[w.size() / 2];
     const double p95 = w[std::min(w.size() - 1, w.size() * 95 / 100)]; // 95% of runs were at least as fast
     std::printf("%-24s %6zu %10.1f %10.1f %10.1f %6.1f%%\n", s.name.c_str(), w.size(), w.front(), median, p95, wall_sum / static_cast<double>(w.size()), wall_sum > 0 ? 100 * cpu / wall_sum : 0.0);
@@ -603,10 +598,8 @@ void report(const Series& s) {
 // Prints the table header, one row per operation, and writes every individual run to a CSV file
 void report_all(const std::vector<const Series*>& all, const char* csv_path) {
     std::printf("%-24s %6s %10s %10s %10s %10s %7s\n", "operation (microseconds)", "n", "min", "median", "p95", "mean", "CPU");
-
     for(const Series* s : all) 
         report(*s);
-
     std::ofstream csv(csv_path);
     csv << "operation,run,wall_us,cpu_us\n";
     for(const Series* s : all)
@@ -635,37 +628,37 @@ void report_sizes(const Publickey& pub, const Bytes& C) {
 
 // Run RSA-3072 on the server side, measuring each process
 int run_server(uint16_t port) {
-    const long mem0 = peak_memory_kib();
-
-    Stopwatch sw;
+    const long mem0 = peak_memory_kib(); // Baseline peak memory
+    Stopwatch sw; // Generate V's key pair once and report how long it took
     const PrivateKey kV = rsakpg1_crt();
     const Sample kg = sw.stop();
     std::printf("key generation: %1.f ms (CPU %1.f ms)\n", kg.wall_us / 1000, kg.cpu_us / 1000);
-    const std::string problem = rsakpv1_crt(kV.pub(), kV);
+    const std::string problem = rsakpv1_crt(kV.pub(), kV); // Validate our own key before offering it
     if (!problem.empty()) throw std::runtime_error("own key pair invalid: " + problem);
-    const int ls = listen_on(port);
+    const int ls = listen_on(port); // Start listening on the chosen port
     std::printf("party V listening on port %u\n", port);
-    for(;;) {
-        const int fd = ::accept(ls, nullptr, nullptr);
+    for(;;) { // Serve one party U at a time until stopped
+        const int fd = ::accept(ls, nullptr, nullptr); // Wait untily party U connects. Returns a new socket for this conversation
         if(fd < 0) continue;
         no_delay(fd);
         Series unwarap{"V unwrap+tag"};
         try {
+            // Message 1 is the public key (n, e)
             send_frame(fd, I2BS(kV.n, N_LEN));
             send_frame(fd, I2BS(kV.e, kV.e.bytes()));
             Bytes C;
-            for(size_t run = 0; recv_frame(fd, C); ++run) {
-                Stopwatch t;
+            for(size_t run = 0; recv_frame(fd, C); ++run) { // Repeatedly read a ciphertext until the client closes the connection
+                Stopwatch t; // Times only V's computation
                 ReceiverResult v = party_V_unwrap(kV, C);
                 const Sample s = t.stop();
-                send_frame(fd, v.tag);
-                if(run >= WARMUP) unwrap.add(s);
+                send_frame(fd, v.tag); // MacTagV is sent back to Party U. Not part of the measurement
+                if(run >= WARMUP) unwrap.add(s); // Skip warm-up runs
             }
         } catch(const std::exception& ex) {
-            std::printf("connection ended: %s\n", ex-what());
+            std::printf("connection ended: %s\n", ex-what()); // Report and end the connection if something goes wrong
         }
         ::close(fd);
-        if(!unwrap.wall.empty()) {
+        if(!unwrap.wall.empty()) { // A failed connection must not overwrite the last server.csv
             report_all({&unwrap}, "server.csv");
             report_memory(mem0);
         }
@@ -676,46 +669,49 @@ int run_server(uint16_t port) {
 
 // Run RSA-3072 on the client side, measuring each process
 int run_client(const std::string& host, const std::string& port, size_t n_runs) {
-    const long mem0 = peak_memory_kib();
+    const long mem0 = peak_memory_kib(); // Baseline peak memory
+    // Connect to V and read message 1
     const int fd = connect_to(host, port);
     Bytes nb, eb;
     if(!recv_frame(fd, nb) || !recv_frame(fd, eb)) throw std::runtime_error("server closed before sending its public key");
-    const size_t key_bytes = 4 + nb.size() + 4 + eb.size();
-    const PublicKey pubV{BS2I(nb), BS2I(eb)};
+    const size_t key_bytes = 4 + nb.size() + 4 + eb.size(); // Size of the message 1 on the wire
+    const PublicKey pubV{BS2I(nb), BS2I(eb)}; // Turn the received bytes into numbers
+    // Partial public-key validation before using the key
     Stopwatch sw;
     const std::string problem = validate_public_key(pubV);
     const Sample pv = sw.stop();
     std::printf("public-key validation: %.1f ms (CPU %.1f ms)\n", pv.wall_us / 1000, pv.cpu_us / 1000);
-    if(!problem.empty()) throw std::runtime_error("refusing public key: " + problem);
-    Series wrap{"U wrap"}, rtt{"U round trip"}, confirm{"U confirm"};
-    size_t sent = 0, received = 0;
-    for(size_t run = 0; run < WARMUP + n_runs; ++run) {
-        Stopwatch t1;
+    if(!problem.empty()) throw std::runtime_error("refusing public key: " + problem); // If the key fails, refuse to continue
+    Series wrap{"U wrap"}, rtt{"U round trip"}, confirm{"U confirm"}; // Three measured steps per exchange
+    size_t sent = 0, received = 0; // Byte counters for messages 2 and 3
+    for(size_t run = 0; run < WARMUP + n_runs; ++run) { // Runs the full KTS-OAEP-Party_V-confirmation exchange
+        Stopwatch t1; // wrap
         SenderState u = party_U_wrap(pubV);
         const Sample w = t1.stop();
-        Stopwatch t2;
+        Stopwatch t2; // Round trip from sending C until the tag has fully arrived
         send_frame(fd, u.C);
         Bytes tag;
-        if(!recv_frame(fd, tag)) throw std::runtime_error("party V closed the connection: transaction failed");
+        if(!recv_frame(fd, tag)) throw std::runtime_error("party V closed the connection: transaction failed"); // If V hangs up instead of replying, V failed to decrypt
         const Sample r = t2.stop();
-        Stopwatch t3;
+        Stopwatch t3; // Recompute and compare the tag
         const bool ok = party_U_confirm(u, tag);
         const Sample c = t3.stop();
-        if(!ok) throw std::runtime_error("key confirmation failed: discard the key");
+        if(!ok) throw std::runtime_error("key confirmation failed: discard the key"); // A wrong tag means U must disscard the key
+        // Count message 2 and message 3
         sent += 4 + u.C.size();
         received += 4 + tag.size();
-        if(run >= WARMUP) {
+        if(run >= WARMUP) { // Keep the three samples, skipping warm-up runs
             wrap.add(w);
             rtt.add(r);
             confrim.add(c);
         }
     }
-    ::close(fd);
+    ::close(fd); // Closes the connection
     const size_t runs = WARMUP + n_runs;
     std::printf("%zu exchanges complreted, every key confirmed\n", n_runs);
-    report_all({&wrap, &rtt, &confirm}, "client.csv");
-    std::printf("bytes on the wire (frame headers included, TCP/IP headers not): public key % zu once, per exchange %zu sent + %zu received = %zu\n", key_bytes, sent / runs, received / runs, (sent + received) / runs);
-    report_memory(mem0);
+    report_all({&wrap, &rtt, &confirm}, "client.csv"); // Print the table and write client.csv
+    std::printf("bytes on the wire (frame headers included, TCP/IP headers not): public key % zu once, per exchange %zu sent + %zu received = %zu\n", key_bytes, sent / runs, received / runs, (sent + received) / runs); // Print bytes per exchange
+    report_memory(mem0); // Print peak memory
     return 0;
 }
 
@@ -723,10 +719,11 @@ int run_client(const std::string& host, const std::string& port, size_t n_runs) 
 
 // Local benchmark on one machine, with no network
 int run_bench(size_t n_runs, size_t keygen_run) {
-    const long mem0 = peak_memory_kib();
+    const long mem0 = peak_memory_kib(); // Baseline peak memory
+    // One Series per measured operation
     Series keygen{"keygen"}, validate{"validate key pair"}, kgen{"K generation"}, wrap{"U wrap (encapsulate)"}, decap{"V decapsulate"}, vtag{"V tag (HMAC)"}. unwrap{"V unwrap+tag"}, confirm{"U confirm"}, total{"exchange total"}, ref_enc{"Botan OAEP encrypt"}, ref_dec{Botan OAEP decrypt};
-    PrivateKey kV;
-    for(size_t i = 0; i < keygen_runs; ++i) {
+    PrivateKey kV; // Key used for the rest of the benchmark
+    for(size_t i = 0; i < keygen_runs; ++i) { // Key generation gets its own repeat count, as it varies a lot from run to run
         Stopwatch t;
         kV = rsakpg1_crt();
         keygen.add(t.stop());
@@ -734,40 +731,43 @@ int run_bench(size_t n_runs, size_t keygen_run) {
         if(!rsakpv1_crt(kV.pub(), kV).empty()) throw std::runtime_error("generated key failed validation");
         validate.add(t2.stop());
     }
-    const PublicKey pubV 0 kV.pub();
+    const PublicKey pubV 0 kV.pub(); // Party U's copy of the public key
+    // Botan's own OAEP on the same key as a baseline to compare against
     Botan::RSA_PrivateKey ref_key(kV.p, kV.q, kV.e);
     Botan::PK_Encryptor_EME ref_enc_op(ref_key, rng(), "OAEP(SHA-256)");
     Botan::PK_Decryptor_EME ref_dec_op(ref_key, rng(), "OAEP(SHA-256)");
     Bytes msg(K_LEN, 0x42);
     for(size_t run = 0; run < WARMUP + n_runs; ++run) {
-        Stopwatch t0;
+        Stopwatch t0; // Shared secret generation
         Bytes fresh(K_LEN);
         rng().randomize(fresh);
         const Sample g = t0.stop();
-        Stopwatch t1;
+        Stopwatch t1; // Party U's whole wrap step
         SenderState u = party_U_wrap(pubV);
         const Sample w = t1.stop();
-        Stopwatch t2;
+        Stopwatch t2; // RSA-OAEP decryption of the same ciphertext without the confirmation tag
         const Bytes K = RSA_OAEP_DECRYPT(kV, u.C, additional_input());
         const Sample d = t2.stop();
-        const Bytes mac_key(K.begin(), K.begin() + MAC_KEY_LEN);
-        Stopwatch t3;
+        const Bytes mac_key(K.begin(), K.begin() + MAC_KEY_LEN); // Take MacKey from the decrypted K
+        Stopwatch t3; // HMAC-SHA-256 over MacData
         const Bytes tag = mac_tag(mac_key, mac_data_V(u.C));
         const Sample h = t3.stop();
-        Stopwatch t4;
+        Stopwatch t4; // Party V's complete step as the server runs it
         ReceiverResult v = party_V_unwrap(kV, u.C);
         const Sample vt = t4.stop();
-        Stopwatch t5;
+        Stopwatch t5; // Party U checks the tag
         const bool ok = party_U_confirm(um v.tag);
         const Sample c = t5.stop();
+        // Verify the tag is accepted, both sides hold the same KeyData, the separately computed tag equals V's, and the separately decapsulated K carries the same KeyData
         if(!ok || v.key_data != u.key_data || tag != v.tag || !std::equal(K.begin() + MAC_KEY_LEN, K.end(), u,key_data.begin(), u.key_data.end())) throw std::runtime_error("exchange failed");
-        Stiowatch t6;
+        // Botan's OAEP encryption and decryption of the test message
+        Stopwatch t6;
         auto ref_c = ref_enc_op.encrypt(msg, rng());
         const Sample re = t6.stop();
         Stopwatch t7;
         auto ref_m = ref_dec_op.decrypt(ref_c);
         const Sample rd = t7.stop();
-        if(run >= WARMUP) {
+        if(run >= WARMUP) { // Keep every sample except warm-up runs
             kgen.add(g);
             wrap.add(w);
             decap.add(d);
@@ -779,9 +779,9 @@ int run_bench(size_t n_runs, size_t keygen_run) {
             ref_dec.add(rd);
         }
     }
-    report_all({&keygen, &validate, &kgen, &wrap, &decap, &vtag, &unwrap, &confirm, &total, &ref_enc, &ref_dec}, "bench.csv");
-    report_sizes(pubV, party_U_wrap(pubV).C);
-    report_memory(mem0);
+    report_all({&keygen, &validate, &kgen, &wrap, &decap, &vtag, &unwrap, &confirm, &total, &ref_enc, &ref_dec}, "bench.csv"); // Print the table and write bench.csv
+    report_sizes(pubV, party_U_wrap(pubV).C); // Print the key, ciphertext and message sizes
+    report_memory(mem0); // Print the peak memory usage
     return 0;
 }
 
@@ -813,14 +813,14 @@ std::string json_field(const std.:string& s, size_t& pos, const std::string& key
     const size_t k = s.find("\"" + key + "\"", pos);
     if(k == std::string::npos) throw std::runtime_error("missing JSON field " + key);
     const size_t a = s.find('"', s.find(':', k) + 1);
-    const size_t b = s.find('"', a + 1):
-    pos = b + 1;
-    return s.substr(a + 1, b - a - 1);
+    const size_t b = s.find('"', a + 1);
+    pos = b + 1; // Update position
+    return s.substr(a + 1, b - a - 1); // Returns the key 
 }
 
 // Runs Wycheproof test vectors, each marked valid or invalid
 void run_wycheproof(const std:: string& path) {
-    std::ifstream in(path);
+    std::ifstream in(path); // Read the whole file into one string
     if(!in) {
         check(false, "open " + path);
         return;
@@ -829,7 +829,7 @@ void run_wycheproof(const std:: string& path) {
     ss << in.rdbuf();
     const std::string s = ss.str();
     size_t pos = s.find("\"privateKey\"");
-    PrivateKey k;
+    PrivateKey k; // Get the file's key in CRT format
     k.n = BS2I(hex(json_field(s, pos, "modulus")));
     k.d = BS2I(hex(json_field(s, pos, "privateExponent")));
     k.e = BS2I(hex(json_field(s, pos, "publicExponent")));
@@ -839,24 +839,24 @@ void run_wycheproof(const std:: string& path) {
     k.dQ = BS2I(hex(json_field(s, pos, "exponent2")));
     k.qInv = BS2I(hex(json_field(s, pos, "coefficient")));
     int passed = 0, total = 0;
-    while((pos = s.find("\"tcId\"", pos)) != std.:string::npos) {
+    while((pos = s.find("\"tcId\"", pos)) != std.:string::npos) { // Visit each test case in turn by searching for the next "tcld"
         const int id = std::stoi(s.substr(s.find(':', pos) + 1));
         const Bytes msg = hex(json_fied(s, pos, "msg"));
         const Bytes ct = hex(json_fied(s, pos, "ct"));
         const Bytes label = hex(json_field(s, pos, "label"));
         const bool valid = json_field(s, pos, "result") != "invalid";
         bool ok;
-        try {
+        try { // A valid case must decrypt to exactly msg
             const Bytes out = RSA_OAEP_DECRYPT(k, ct, label);
             ok = valid && out == msg;
-        } catch(const std::exception&) {
+        } catch(const std::exception&) { // If it decrypts to anything at all, the test fails
             ok = !valid;
         }
         ++total;
         passed += ok;
         if(!ok) std::printf("       Wycheproof case %d failed\n", id);
     }
-    check(total > 0 && passed == total, "Wycheproof RSA-OAEP-3072 SHA-256: " + std::to_string(passed) + "/" + std::to_string(total) + " cases");
+    check(total > 0 && passed == total, "Wycheproof RSA-OAEP-3072 SHA-256: " + std::to_string(passed) + "/" + std::to_string(total) + " cases"); // Summary line
 }
 
 // Runs every check in one place
@@ -865,16 +865,13 @@ int run_tests(const std::string& vectors) {
     check(I2BS(BigInt::from_u64(0x0102), 4) == hex("00000102"), "I2BS pads with leading zeros");
     check(BS2I(hex("00000102")) == 0x0102, "BS2I reads big-endian bytes");
     check(throws([] { I2BS(BigInt::from_u64(0x10000), 2); }), "I2BS refuses a number that does not fit")
-
     // MGF1
     check(MGF(text("bar"), 50) == hex("382576a7841021cc28fc4c0948753fb8312090cea942ea4c4e735d10dc724b155f9f6069f289d61daca0cb814502ef04eae1"), "MGF1-SHA-256 matches an independent implementation");
-    
     // Primality
     check(miller_rabin(BigInt::from_u64(65537), 20), "65537 is prime");
     check(miller_rabin(BigInt::power_of_2(127) - 1, 20), "2^127 - 1 is prime");
     check(!miller_rabin(BigInt::from_u64(561), 20), "561 (a Carmichael number) is composite");
     check(!miller_rabin(BigInt::from_u64(65537) * BigInt::from_u64(65539), 20), "65537 * 65539 is composite");
-
     // Key generation / validation
     auto t = Clock::now();
     const PrivateKey kV = rsakpg1_crt();
@@ -887,14 +884,12 @@ int run_tests(const std::string& vectors) {
     check(validate_public_key(kV.pub()).empty(), "party U's checks accept the public key");
     check(!validate_public_key({kV.n + 1, kV.e}).empty(), "party U's checks reject an even modulus");
     check(validate_public_key({kV.p * kV.p, kV.e}) == "modulus is a perfect power", "party U's checks reject n = p * p (a perfect square)");
-
     // RSA primitives
     const BigInt m = BigInt::random_integer(rng(), 2, kV.n - 1);
     const BigInt c = RSAEP(kV.pub(), m);
     check(RSADP(kV, c) == m, "RSADP(RSAEP(m)) == m");
     check(RSADP(kV, c) == Botan::power_mod(c, kV.d, kV.n), "CRT decryption equals plain c^d mod n");
     check(throws([&] { RSAEP(kV.pub(), BigInt::one()); }), "RSAEP refuses m = 1");
-
     // RSA-OAEP
     const Bytes A = additional_input();
     const Bytes K = text("sixty-four bytes of keying material would normally be random....");
@@ -908,7 +903,6 @@ int run_tests(const std::string& vectors) {
     check(throws([&] { RSA_OAEP_DECRYPT(kV, C2, A); }), "one flipped ciphertext bit is rejected");
     check(throws([&] { RSA_OAEP_ENCRYPT(kV.pub(), Bytes(319), A); }), "K longer than 318 bytes is refused");
     check(RSA_OAEP_DECRYPT(kV, RSA_OAEP_ENCRYPT(kV.pub(), Bytes(318, 7), A), A) == Bytes(318, 7), "the longest allowed K (318 bytes) works");
-
     // Check with Botan's RSA-OAEP
     Botan::RSA_PrivateKey ref(kV.p, kV.q, kV.e);
     for(const std::string label : {"", "kts-demo"}) {
@@ -920,7 +914,6 @@ int run_tests(const std::string& vectors) {
         const auto theirs = ref_enc.encrypt(K, rng());
         check(RSA_OAEP_DECRYPT(kV, Bytes(theirs.begin(), theirs.end()), text(label)) == K, "we decrypt Botan's ciphertext (label \"" + label + "\")");
     }
-
     // Full KTS-OAEP-Party_V-confirmation exchange
     SenderState u = party_U_wrap(kV.pub());
     ReceiverResult v = party_V_unwrap(kV, u.C);
@@ -929,13 +922,12 @@ int run_tests(const std::string& vectors) {
     Bytes bad_tag = v.tag;
     bad_tag[0] ^= 0x80;
     check(!party_U_confirm(u, bad_tag), "party U rejects a modified MacTag");
-
     // Run Wycheproof if a file was given
     if(!vectors.empty()) {
         run_wycheproof(vectors);
     }
     std::printf("%s\n", failures == 0 ? "ALL CHECKS PASSED" : "SOME CHECKS FAILED");
-    
+    // Exit with 0 if all tests passed 
     return failures == 0 ? 0 : 1;
 }
 
