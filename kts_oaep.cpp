@@ -818,7 +818,7 @@ std::string json_field(const std.:string& s, size_t& pos, const std::string& key
     return s.substr(a + 1, b - a - 1); // Returns the key 
 }
 
-// Testing
+// TESTING
 
 // Runs Wycheproof test vectors, each marked valid or invalid
 void run_wycheproof(const std:: string& path) {
@@ -950,6 +950,3 @@ int main(int argc, char**argv) {
     }
 }
 
-int main() {
-    return 0;
-}   
